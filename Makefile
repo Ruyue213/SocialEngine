@@ -8,7 +8,8 @@ BUILD := build
 BIN := bin
 
 ENGINE_SRC := $(wildcard src/common/*.cpp src/memory/*.cpp src/storage/*.cpp \
-                src/concurrency/*.cpp src/cache/*.cpp src/graph/*.cpp src/baseline/*.cpp)
+                src/concurrency/*.cpp src/cache/*.cpp src/graph/*.cpp src/baseline/*.cpp \
+                src/net/*.cpp src/service/*.cpp)
 ENGINE_OBJ := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(ENGINE_SRC))
 
 HIREDIS_SRC := third_party/hiredis/alloc.c third_party/hiredis/hiredis.c \
@@ -19,14 +20,19 @@ HIREDIS_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(HIREDIS_SRC))
 
 BENCH_OBJ := $(BUILD)/obj/bench/bench_main.o
 TEST_OBJ := $(BUILD)/obj/tests/test_main.o
+SERVER_OBJ := $(BUILD)/obj/server/server_main.o
 
-all: $(BIN)/bench $(BIN)/tests
+all: $(BIN)/bench $(BIN)/tests $(BIN)/server
 
 $(BUILD)/obj/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD)/obj/tests/test_main.o: tests/test_main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/obj/server/server_main.o: src/server/server_main.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -39,6 +45,10 @@ $(BIN)/bench: $(BENCH_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/tests: $(TEST_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
+	@mkdir -p $(BIN)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/server: $(SERVER_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
 	@mkdir -p $(BIN)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -57,7 +67,7 @@ bench: $(BIN)/bench
 clean:
 	rm -rf $(BUILD) $(BIN)
 
-DEPFILES := $(ENGINE_OBJ:.o=.d) $(HIREDIS_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+DEPFILES := $(ENGINE_OBJ:.o=.d) $(HIREDIS_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(SERVER_OBJ:.o=.d)
 -include $(DEPFILES)
 
 .PHONY: all asan debug test bench clean

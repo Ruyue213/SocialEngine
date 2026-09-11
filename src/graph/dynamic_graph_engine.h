@@ -60,6 +60,7 @@ class DynamicGraphEngine : public IGraphEngine {
     size_t keep_tail_threshold = 256;
     double hole_ratio_threshold = 0.4;
     size_t cache_max_friends = 512;
+    std::string cache_namespace;
   };
 
   explicit DynamicGraphEngine(const Config& cfg);
@@ -75,6 +76,9 @@ class DynamicGraphEngine : public IGraphEngine {
   SlabPool& pool() { return pool_; }
   size_t pool_thread_count() const { return workers_.thread_count(); }
   bool cache_available() const { return redis_ && redis_->enabled(); }
+
+  void DedupCheck(const std::string& key, int ttl_seconds,
+                  std::function<void(bool)> cb);
 
   void SetCacheInvalidation(bool on) {
     cache_invalidation_.store(on, std::memory_order_relaxed);

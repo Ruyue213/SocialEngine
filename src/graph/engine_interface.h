@@ -17,6 +17,7 @@ struct QueryResult {
 
 struct QueryRequest {
   uint64_t seq = 0;
+  uint64_t start_us = 0;
   QueryType type = QueryType::kDistance;
   uint32_t a = 0;
   uint32_t b = 0;

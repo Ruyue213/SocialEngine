@@ -43,6 +43,9 @@ class RedisClient {
   void EvalWriteAsync(const std::vector<std::string>& keys, const std::string& script,
                       std::function<void()> cb = nullptr);
 
+  void SetNxAsync(const std::string& key, int ttl_seconds,
+                  std::function<void(bool)> cb);
+
   void SetAsync(const std::string& key, const std::string& value, std::function<void()> cb = nullptr);
 
   void DelAsync(const std::string& key, std::function<void()> cb = nullptr);
@@ -59,7 +62,7 @@ class RedisClient {
 
  private:
   struct Op {
-    enum class Type { kGet, kSet, kDel, kIncr, kEvalRead, kEvalWrite } type;
+    enum class Type { kGet, kSet, kDel, kIncr, kEvalRead, kEvalWrite, kEvalResult } type;
     std::string key;
     std::vector<std::string> keys;
     std::string value;
@@ -67,6 +70,7 @@ class RedisClient {
     std::function<void(bool, const std::string&)> get_cb;
     std::function<void()> done_cb;
     std::function<void(int64_t)> incr_cb;
+    std::function<void(bool)> result_cb;
   };
 
   void IoLoop(size_t idx);

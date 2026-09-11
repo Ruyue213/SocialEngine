@@ -118,6 +118,13 @@ bool RedisClient::AppendCommand(redisContext* ctx, Op& op, std::string& sha) {
                          k4, s4, k5, s5);
       return true;
     }
+    case Op::Type::kEvalResult: {
+      sha = sha1_hex(op.script);
+      redisAppendCommand(ctx, "EVALSHA %s %d %b %b", sha.c_str(),
+                         static_cast<int>(op.keys.size()), k0, s0, op.value.data(),
+                         op.value.size());
+      return true;
+    }
   }
   return true;
 }
@@ -158,6 +165,13 @@ void RedisClient::HandleReply(Op& op, redisReply* r) {
       }
       break;
     }
+    case Op::Type::kEvalResult: {
+      bool acquired = r->type == REDIS_REPLY_STATUS || r->type == REDIS_REPLY_STRING;
+      if (op.result_cb) {
+        schedule_([cb = std::move(op.result_cb), acquired]() { cb(acquired); });
+      }
+      break;
+    }
     case Op::Type::kSet:
     case Op::Type::kDel:
     case Op::Type::kEvalWrite: {
@@ -175,6 +189,11 @@ void RedisClient::DropOp(Op& op) {
     case Op::Type::kEvalRead:
       if (op.get_cb) {
         schedule_([cb = std::move(op.get_cb)]() mutable { cb(false, ""); });
+      }
+      break;
+    case Op::Type::kEvalResult:
+      if (op.result_cb) {
+        schedule_([cb = std::move(op.result_cb)]() { cb(false); });
       }
       break;
     case Op::Type::kGet:
@@ -280,7 +299,8 @@ void RedisClient::IoLoop(size_t idx) {
         fail = true;
         break;
       }
-      if ((batch[i].type == Op::Type::kEvalRead || batch[i].type == Op::Type::kEvalWrite) &&
+      if ((batch[i].type == Op::Type::kEvalRead || batch[i].type == Op::Type::kEvalWrite ||
+           batch[i].type == Op::Type::kEvalResult) &&
           r != nullptr && r->type == REDIS_REPLY_ERROR &&
           strstr(r->str, "NOSCRIPT") != nullptr) {
         freeReplyObject(r);
@@ -290,15 +310,25 @@ void RedisClient::IoLoop(size_t idx) {
       HandleReply(batch[i], r);
     }
     for (size_t i : noscript) {
-      redisReply* r = static_cast<redisReply*>(redisCommand(
-          ctx, "EVAL %s %d %b %b %b %b %b %b", batch[i].script.c_str(),
-          static_cast<int>(batch[i].keys.size()),
-          batch[i].keys.size() > 0 ? batch[i].keys[0].data() : "", batch[i].keys.size() > 0 ? batch[i].keys[0].size() : 0,
-          batch[i].keys.size() > 1 ? batch[i].keys[1].data() : "", batch[i].keys.size() > 1 ? batch[i].keys[1].size() : 0,
-          batch[i].keys.size() > 2 ? batch[i].keys[2].data() : "", batch[i].keys.size() > 2 ? batch[i].keys[2].size() : 0,
-          batch[i].keys.size() > 3 ? batch[i].keys[3].data() : "", batch[i].keys.size() > 3 ? batch[i].keys[3].size() : 0,
-          batch[i].keys.size() > 4 ? batch[i].keys[4].data() : "", batch[i].keys.size() > 4 ? batch[i].keys[4].size() : 0,
-          batch[i].keys.size() > 5 ? batch[i].keys[5].data() : "", batch[i].keys.size() > 5 ? batch[i].keys[5].size() : 0));
+      redisReply* r = nullptr;
+      if (batch[i].type == Op::Type::kEvalResult) {
+        r = static_cast<redisReply*>(redisCommand(
+            ctx, "EVAL %s %d %b %b", batch[i].script.c_str(),
+            static_cast<int>(batch[i].keys.size()),
+            batch[i].keys.size() > 0 ? batch[i].keys[0].data() : "",
+            batch[i].keys.size() > 0 ? batch[i].keys[0].size() : 0, batch[i].value.data(),
+            batch[i].value.size()));
+      } else {
+        r = static_cast<redisReply*>(redisCommand(
+            ctx, "EVAL %s %d %b %b %b %b %b %b", batch[i].script.c_str(),
+            static_cast<int>(batch[i].keys.size()),
+            batch[i].keys.size() > 0 ? batch[i].keys[0].data() : "", batch[i].keys.size() > 0 ? batch[i].keys[0].size() : 0,
+            batch[i].keys.size() > 1 ? batch[i].keys[1].data() : "", batch[i].keys.size() > 1 ? batch[i].keys[1].size() : 0,
+            batch[i].keys.size() > 2 ? batch[i].keys[2].data() : "", batch[i].keys.size() > 2 ? batch[i].keys[2].size() : 0,
+            batch[i].keys.size() > 3 ? batch[i].keys[3].data() : "", batch[i].keys.size() > 3 ? batch[i].keys[3].size() : 0,
+            batch[i].keys.size() > 4 ? batch[i].keys[4].data() : "", batch[i].keys.size() > 4 ? batch[i].keys[4].size() : 0,
+            batch[i].keys.size() > 5 ? batch[i].keys[5].data() : "", batch[i].keys.size() > 5 ? batch[i].keys[5].size() : 0));
+      }
       if (r == nullptr) {
         redisFree(ctx);
         ctx = nullptr;
@@ -405,6 +435,26 @@ void RedisClient::EvalWriteAsync(const std::vector<std::string>& keys,
   op.done_cb = std::move(cb);
   size_t idx = rr_.fetch_add(1, std::memory_order_relaxed) % io_queues_.size();
   EnqueueWrite(idx, std::move(op));
+}
+
+void RedisClient::SetNxAsync(const std::string& key, int ttl_seconds,
+                            std::function<void(bool)> cb) {
+  if (!enabled_.load(std::memory_order_relaxed) || stop_) {
+    if (cb) {
+      schedule_([cb = std::move(cb)]() { cb(true); });
+    }
+    return;
+  }
+  Op op;
+  op.type = Op::Type::kEvalResult;
+  op.keys = {key};
+  op.script =
+      "if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then return 'OK' else return "
+      "nil end";
+  op.value = std::to_string(ttl_seconds);
+  op.result_cb = std::move(cb);
+  size_t idx = rr_.fetch_add(1, std::memory_order_relaxed) % io_queues_.size();
+  EnqueueRead(idx, std::move(op));
 }
 
 void RedisClient::SetAsync(const std::string& key, const std::string& value,

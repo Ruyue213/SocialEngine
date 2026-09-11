@@ -12,6 +12,12 @@
 #include <vector>
 
 #include "baseline/baseline_engine.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include "common/affinity.h"
 #include "graph/dynamic_graph_engine.h"
 #include "graph/engine_interface.h"
@@ -41,11 +47,122 @@ struct BenchArgs {
   uint64_t mix_add = 5;
   uint64_t mix_del = 5;
   double zipf = 1.0;
+  bool http = false;
+  std::string http_host = "127.0.0.1";
+  int http_port = 8080;
 };
 
 constexpr int kLatBuckets = 40;
 constexpr uint64_t kBackoffBaseUs = 1000;
 constexpr int kBackoffMaxShift = 6;
+
+struct HttpClient {
+  int fd = -1;
+  std::string in;
+
+  ~HttpClient() {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
+
+  bool Connect(const std::string& host, int port) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      return false;
+    }
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+      ::close(fd);
+      fd = -1;
+      return false;
+    }
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return true;
+  }
+
+  bool Post(const std::string& path, const std::string& body, int* status,
+            std::string* resp_body) {
+    std::string req = "POST " + path +
+                      " HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                      "Content-Length: " +
+                      std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" +
+                      body;
+    if (!SendAll(req)) {
+      return false;
+    }
+    return ReadResponse(status, resp_body);
+  }
+
+  bool Get(const std::string& path, int* status, std::string* resp_body) {
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if (!SendAll(req)) {
+      return false;
+    }
+    return ReadResponse(status, resp_body);
+  }
+
+  bool SendAll(const std::string& data) {
+    size_t off = 0;
+    while (off < data.size()) {
+      ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+      if (n <= 0) {
+        return false;
+      }
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  bool ReadResponse(int* status, std::string* body) {
+    while (true) {
+      size_t hdr_end = in.find("\r\n\r\n");
+      if (hdr_end == std::string::npos) {
+        if (in.size() > 1 << 20) {
+          return false;
+        }
+        char buf[8192];
+        ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+          return false;
+        }
+        in.append(buf, static_cast<size_t>(n));
+        continue;
+      }
+      std::string head = in.substr(0, hdr_end);
+      *status = atoi(head.substr(9, 3).c_str());
+      size_t clen = 0;
+      size_t pos = head.find("Content-Length:");
+      if (pos != std::string::npos) {
+        clen = strtoull(head.substr(pos + 15).c_str(), nullptr, 10);
+      }
+      size_t total = hdr_end + 4 + clen;
+      while (in.size() < total) {
+        char buf[8192];
+        ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+          return false;
+        }
+        in.append(buf, static_cast<size_t>(n));
+      }
+      *body = in.substr(hdr_end + 4, clen);
+      in.erase(0, total);
+      return true;
+    }
+  }
+};
 
 struct ZipfSampler {
   std::vector<double> cdf;
@@ -259,6 +376,76 @@ void ClientLoop(IGraphEngine& engine, BenchCtx& ctx, const BenchArgs& args, size
   }
 }
 
+void ClientLoopHttp(BenchCtx& ctx, const BenchArgs& args, size_t client_id,
+                    const std::vector<std::pair<uint32_t, uint32_t>>& edges,
+                    std::atomic<bool>& run, const ZipfSampler& zipf) {
+  HttpClient cli;
+  if (!cli.Connect(args.http_host, args.http_port)) {
+    printf("client %zu: connect failed\n", client_id);
+    return;
+  }
+  std::mt19937_64 rng(args.seed ^ (client_id * 0x9E3779B97F4A7C15ULL));
+  uint32_t n = static_cast<uint32_t>(args.nodes);
+  bool use_zipf = args.zipf > 0.0 && zipf.cdf.size() > 1;
+  auto pick_node = [&]() -> uint32_t {
+    if (use_zipf) {
+      return zipf.Sample(rng);
+    }
+    return 1 + static_cast<uint32_t>(rng() % n);
+  };
+  const uint64_t cf_p = args.mix_cf;
+  const uint64_t sd_p = args.mix_sd;
+  const uint64_t dist_p = args.mix_dist;
+  const uint64_t add_p = args.mix_add;
+  char body[256];
+  while (run.load(std::memory_order_relaxed)) {
+    uint64_t roll = rng() % 100;
+    uint32_t u = pick_node();
+    uint32_t v = pick_node();
+    if (u == v) {
+      v = v % n + 1;
+    }
+    int status = 0;
+    std::string resp;
+    if (roll < cf_p + sd_p + dist_p) {
+      const char* t = roll < cf_p ? "cf" : (roll < cf_p + sd_p ? "sd" : "dist");
+      std::snprintf(body, sizeof(body), "{\"type\":\"%s\",\"a\":%u,\"b\":%u}", t, u, v);
+      auto start = std::chrono::steady_clock::now();
+      if (!cli.Post("/query", body, &status, &resp)) {
+        if (!cli.Connect(args.http_host, args.http_port)) {
+          SleepUs(1000);
+        }
+        continue;
+      }
+      auto now = std::chrono::steady_clock::now();
+      uint64_t us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+      if (status == 503) {
+        ctx.shed.fetch_add(1, std::memory_order_relaxed);
+        SleepUs(1000 << (roll % 5));
+        continue;
+      }
+      Record(ctx, us);
+      continue;
+    }
+    if (roll < cf_p + sd_p + dist_p + add_p) {
+      std::snprintf(body, sizeof(body), "{\"op\":\"add\",\"u\":%u,\"v\":%u}", u, v);
+      if (cli.Post("/edge", body, &status, &resp) && status == 200) {
+        ctx.updates_done.fetch_add(1, std::memory_order_relaxed);
+      }
+      continue;
+    }
+    if (!edges.empty()) {
+      const auto& e = edges[rng() % edges.size()];
+      std::snprintf(body, sizeof(body), "{\"op\":\"del\",\"u\":%u,\"v\":%u}", e.first,
+                    e.second);
+      if (cli.Post("/edge", body, &status, &resp) && status == 200) {
+        ctx.updates_done.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+}
+
 void PrintLatency(BenchCtx& ctx, const char* label) {
   uint64_t total = ctx.completed.load(std::memory_order_relaxed);
   if (total == 0) {
@@ -289,6 +476,18 @@ void PrintLatency(BenchCtx& ctx, const char* label) {
          static_cast<unsigned long long>(pctl(0.99)),
          static_cast<unsigned long long>(pctl(0.999)),
          static_cast<unsigned long long>(ctx.max_us.load(std::memory_order_relaxed)));
+}
+
+void PrintStatsHttp(BenchCtx& ctx, int seconds) {
+  double qps = static_cast<double>(ctx.completed.load(std::memory_order_relaxed)) / seconds;
+  printf("== HTTP 压测结果 ==\n");
+  printf("  completed queries : %llu (qps %.0f)\n",
+         static_cast<unsigned long long>(ctx.completed.load(std::memory_order_relaxed)), qps);
+  printf("  shed (503)        : %llu\n",
+         static_cast<unsigned long long>(ctx.shed.load(std::memory_order_relaxed)));
+  printf("  successful updates: %llu\n",
+         static_cast<unsigned long long>(ctx.updates_done.load(std::memory_order_relaxed)));
+  PrintLatency(ctx, "latency");
 }
 
 void PrintStats(IGraphEngine& engine, BenchCtx& ctx, int seconds, const char* label,
@@ -335,6 +534,7 @@ void Usage() {
       "  --mode M          optimized|baseline|both (default both)\n"
       "  --mix A,B,C,D,E   查询占比%%: 共同好友,二度,距离,加边,删边 (default 55,25,10,5,5)\n"
       "  --zipf S          Zipf偏斜度, 0=均匀 (default 1.0)\n"
+      "  --http H:P        压测远程HTTP服务 (如 127.0.0.1:8080)\n"
       "  --seed S          随机种子 (default 42)\n");
 }
 
@@ -397,6 +597,14 @@ bool ParseArgs(int argc, char** argv, BenchArgs& args) {
       args.mix_del = parse_part(pos);
     } else if (a == "--zipf") {
       args.zipf = atof(need(a));
+    } else if (a == "--http") {
+      std::string hp = need(a);
+      auto pos = hp.find(':');
+      args.http = true;
+      args.http_host = hp.substr(0, pos);
+      if (pos != std::string::npos) {
+        args.http_port = atoi(hp.substr(pos + 1).c_str());
+      }
     } else if (a == "--seed") {
       args.seed = strtoull(need(a), nullptr, 10);
     } else if (a == "--help" || a == "-h") {
@@ -571,6 +779,41 @@ int main(int argc, char** argv) {
   RunResult base;
   bool have_opt = args.mode == "optimized" || args.mode == "both";
   bool have_base = args.mode == "baseline" || args.mode == "both";
+
+  if (args.http) {
+    printf("HTTP模式: 压测 %s:%d（服务端建图由server负责）\n\n", args.http_host.c_str(),
+           args.http_port);
+    HttpClient probe;
+    int status = 0;
+    std::string resp;
+    if (!probe.Connect(args.http_host, args.http_port) || !probe.Get("/healthz", &status, &resp)) {
+      printf("无法连接服务端 %s:%d，请先启动 bin/server\n", args.http_host.c_str(),
+             args.http_port);
+      return 1;
+    }
+    ZipfSampler zipf(args.nodes, args.zipf);
+    BenchCtx meas{};
+    std::atomic<bool> run{true};
+    std::vector<std::thread> clients;
+    clients.reserve(args.clients);
+    for (size_t i = 0; i < args.clients; ++i) {
+      clients.emplace_back([&, i]() {
+        ClientLoopHttp(meas, args, i, edges, run, zipf);
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(args.seconds));
+    run.store(false, std::memory_order_relaxed);
+    for (auto& t : clients) {
+      t.join();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PrintStatsHttp(meas, args.seconds);
+    if (probe.Connect(args.http_host, args.http_port) &&
+        probe.Get("/stats", &status, &resp)) {
+      printf("\n服务端统计: %s\n", resp.c_str());
+    }
+    return 0;
+  }
 
   if (have_opt) {
     dge::DynamicGraphEngine::Config cfg;

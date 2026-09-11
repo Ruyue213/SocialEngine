@@ -1,5 +1,7 @@
 #include "graph/dynamic_graph_engine.h"
 
+#include "common/metrics.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -115,6 +117,11 @@ DynamicGraphEngine::DynamicGraphEngine(const Config& cfg)
       worker_ctxs_(MakeWorkerCtxs(ResolvePoolThreads(cfg), cfg.nodes)),
       workers_(ResolvePoolThreads(cfg), cfg.queue_capacity ? cfg.queue_capacity : 4096,
             cfg.pin_threads, 1, [this](size_t i) { tls_worker_ctx = &worker_ctxs_[i]; }) {
+  if (cfg_.cache_namespace.empty()) {
+    cfg_.cache_namespace =
+        "g" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+        ":";
+  }
   if (cfg_.cache_enabled && !cfg_.redis_host.empty()) {
     RedisClient::Config rcfg;
     rcfg.host = cfg_.redis_host;
@@ -139,10 +146,17 @@ bool DynamicGraphEngine::Submit(QueryRequest&& req) {
     return false;
   }
   queries_submitted_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_queries_submitted_total");
+  metrics::SetGauge("engine_queue_depth", workers_.queue_size());
+  req.start_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
   auto sp = std::make_shared<QueryRequest>(std::move(req));
   bool ok = workers_.Submit([this, sp]() { ProcessQuery(sp); });
   if (!ok) {
     shed_count_.fetch_add(1, std::memory_order_relaxed);
+    metrics::Inc("engine_shed_total");
   }
   return ok;
 }
@@ -183,6 +197,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
           return;
         }
         cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        metrics::Inc("engine_cache_misses_total");
         WorkerCtx& ctx = *tls_worker_ctx;
         d = BidirectionalBfs(req->a, req->b, ctx);
         uint32_t lo = std::min(req->a, req->b);
@@ -204,10 +219,12 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
         std::vector<uint32_t> friends;
         if (ok && !payload.empty() && ParseFriends(payload, friends)) {
           cache_hits_.fetch_add(1, std::memory_order_relaxed);
+          metrics::Inc("engine_cache_hits_total");
           FinishWithFriends(req, std::move(friends));
           return;
         }
         cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        metrics::Inc("engine_cache_misses_total");
         WorkerCtx& ctx = *tls_worker_ctx;
         friends = CommonFriends(req->a, req->b, ctx);
         uint32_t lo = std::min(req->a, req->b);
@@ -229,10 +246,12 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
         std::vector<uint32_t> friends;
         if (ok && !payload.empty() && ParseFriends(payload, friends)) {
           cache_hits_.fetch_add(1, std::memory_order_relaxed);
+          metrics::Inc("engine_cache_hits_total");
           FinishWithFriends(req, std::move(friends));
           return;
         }
         cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        metrics::Inc("engine_cache_misses_total");
         WorkerCtx& ctx = *tls_worker_ctx;
         friends = SecondDegreeBfs(req->a, ctx);
         if (friends.size() <= cfg_.cache_max_friends) {
@@ -250,6 +269,14 @@ void DynamicGraphEngine::FinishWithDistance(const std::shared_ptr<QueryRequest>&
   QueryResult res;
   res.distance = dist;
   queries_completed_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_queries_completed_total");
+  if (req->start_us > 0) {
+    uint64_t now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    metrics::Observe("engine_query_duration_us", now_us - req->start_us);
+  }
   if (req->cb) {
     req->cb(std::move(res));
   }
@@ -260,6 +287,7 @@ void DynamicGraphEngine::FinishWithFriends(const std::shared_ptr<QueryRequest>& 
   QueryResult res;
   res.friends = std::move(friends);
   queries_completed_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_queries_completed_total");
   if (req->cb) {
     req->cb(std::move(res));
   }
@@ -413,8 +441,32 @@ bool DynamicGraphEngine::PrepareAddToNode(uint32_t node, uint32_t id) {
     }
     std::vector<uint32_t> live;
     storage::gather_live(adj, live);
+#ifdef DGE_VERIFY
+    for (size_t k = 1; k < live.size(); ++k) {
+      if (live[k] == live[k - 1]) {
+        fprintf(stderr,
+                "PRE-REBUILD DUP in PrepareAddToNode(node=%u, id=%u): live[%zu]=%u size=%zu "
+                "block_count=%u tail_len=%u\n",
+                node, id, k, live[k], live.size(), adj.block_count, adj.tail_len);
+        exit(4);
+      }
+    }
+#endif
     if (adj.block_count > 0 || live.size() > cfg_.keep_tail_threshold) {
       storage::rebuild_blocks(pool_, adj, live);
+#ifdef DGE_VERIFY
+      {
+        std::vector<uint32_t> chk;
+        storage::gather_live(adj, chk);
+        for (size_t k = 1; k < chk.size(); ++k) {
+          if (chk[k] == chk[k - 1]) {
+            fprintf(stderr, "POST-REBUILD DUP node=%u id=%u: live[%zu]=%u size=%zu\n", node,
+                    id, k, chk[k], chk.size());
+            exit(5);
+          }
+        }
+      }
+#endif
     } else {
       storage::grow_tail(pool_, adj, live);
     }
@@ -446,6 +498,22 @@ bool DynamicGraphEngine::AddEdge(uint32_t u, uint32_t v) {
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_updates_total");
+#ifdef DGE_VERIFY
+  {
+    for (uint32_t node : {u, v}) {
+      std::vector<uint32_t> checkv;
+      storage::gather_live(adj_[node], checkv);
+      for (size_t k = 1; k < checkv.size(); ++k) {
+        if (checkv[k] == checkv[k - 1]) {
+          fprintf(stderr, "ADJ DUP AFTER ADD(%u,%u): node %u dup=%u idx=%zu\n", u, v, node,
+                  checkv[k], k);
+          exit(3);
+        }
+      }
+    }
+  }
+#endif
   InvalidateCache(u, v);
   return true;
 }
@@ -493,6 +561,7 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_updates_total");
   if (storage::node_needs_compaction(adj_[u], cfg_.hole_ratio_threshold)) {
     MarkDirty(u);
   }
@@ -528,6 +597,7 @@ void DynamicGraphEngine::CompactNode(uint32_t node) {
     storage::grow_tail(pool_, adj, maint_scratch_);
   }
   compactions_.fetch_add(1, std::memory_order_relaxed);
+  metrics::Inc("engine_compactions_total");
 }
 
 void DynamicGraphEngine::MaintenanceLoop() {
@@ -577,17 +647,21 @@ void DynamicGraphEngine::InvalidateCache(uint32_t u, uint32_t v) {
 }
 
 std::string DynamicGraphEngine::DistKey(uint32_t u, uint32_t v) const {
-  return "d:" + std::to_string(std::min(u, v)) + ":" + std::to_string(std::max(u, v));
+  return cfg_.cache_namespace + "d:" + std::to_string(std::min(u, v)) + ":" +
+         std::to_string(std::max(u, v));
 }
 
 std::string DynamicGraphEngine::CfKey(uint32_t u, uint32_t v) const {
-  return "cf:" + std::to_string(std::min(u, v)) + ":" + std::to_string(std::max(u, v));
+  return cfg_.cache_namespace + "cf:" + std::to_string(std::min(u, v)) + ":" +
+         std::to_string(std::max(u, v));
 }
 
-std::string DynamicGraphEngine::SdKey(uint32_t u) const { return "sd:" + std::to_string(u); }
+std::string DynamicGraphEngine::SdKey(uint32_t u) const {
+  return cfg_.cache_namespace + "sd:" + std::to_string(u);
+}
 
 std::string DynamicGraphEngine::VersionKey(uint32_t u) const {
-  return "v:" + std::to_string(u);
+  return cfg_.cache_namespace + "v:" + std::to_string(u);
 }
 
 std::string DynamicGraphEngine::SerializeFriends(const std::vector<uint32_t>& f) {
@@ -628,6 +702,17 @@ bool DynamicGraphEngine::ParseFriends(const std::string& s, std::vector<uint32_t
     pos = comma + 1;
   }
   return true;
+}
+
+void DynamicGraphEngine::DedupCheck(const std::string& key, int ttl_seconds,
+                                  std::function<void(bool)> cb) {
+  if (!redis_ || !redis_->enabled()) {
+    if (cb) {
+      cb(true);
+    }
+    return;
+  }
+  redis_->SetNxAsync(key, ttl_seconds, std::move(cb));
 }
 
 EngineStats DynamicGraphEngine::stats() const {

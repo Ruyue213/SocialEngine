@@ -175,6 +175,14 @@ size_t grow_tail(SlabPool& pool, NodeAdjacency& adj,
 
 void rebuild_blocks(SlabPool& pool, NodeAdjacency& adj,
                     const std::vector<uint32_t>& live) {
+#ifdef DGE_VERIFY
+  for (size_t k = 1; k < live.size(); ++k) {
+    if (live[k] == live[k - 1]) {
+      fprintf(stderr, "REBUILD INPUT DUP: live[%zu]=%u (size=%zu)\n", k, live[k], live.size());
+      exit(2);
+    }
+  }
+#endif
   uint8_t* old_head = adj.head;
   uint64_t* old_tail = adj.tail;
   size_t old_tail_cap = static_cast<size_t>(adj.tail_cap) * sizeof(uint64_t);
@@ -209,6 +217,7 @@ void rebuild_blocks(SlabPool& pool, NodeAdjacency& adj,
     if (header_of(cur)->count > 0 &&
         header_of(cur)->data_end + vlen + bitmap_bytes > kBlockPayload) {
       cur = nullptr;
+      prev = 0;
       continue;
     }
     block_append(cur, delta);

@@ -329,6 +329,50 @@ void TestCompaction() {
   e.base->Shutdown();
 }
 
+void TestMultiBlock() {
+  printf("[test] multi-block compression correctness (spaced ids)\n");
+  auto e = MakeEngines(20000);
+  std::vector<uint32_t> targets;
+  for (uint32_t id = 2; id <= 19000; id += 37) {
+    targets.push_back(id);
+  }
+  for (uint32_t t : targets) {
+    CHECK(e.opt->AddEdge(1, t));
+    CHECK(e.base->AddEdge(1, t));
+  }
+  for (uint32_t t : targets) {
+    auto d1 = SyncQuery(*e.opt, dge::QueryType::kDistance, 1, t);
+    auto d2 = SyncQuery(*e.base, dge::QueryType::kDistance, 1, t);
+    CHECK(d1.distance == d2.distance);
+    if (d1.distance != d2.distance) {
+      printf("  dist mismatch for %u: %d vs %d\n", t, d1.distance, d2.distance);
+      break;
+    }
+  }
+  auto cf1 = SyncQuery(*e.opt, dge::QueryType::kCommonFriends, 1, targets[0]);
+  auto cf2 = SyncQuery(*e.base, dge::QueryType::kCommonFriends, 1, targets[0]);
+  CHECK(cf1.friends == cf2.friends);
+  auto sd1 = SyncQuery(*e.opt, dge::QueryType::kSecondDegree, 1);
+  auto sd2 = SyncQuery(*e.base, dge::QueryType::kSecondDegree, 1);
+  CHECK(sd1.friends == sd2.friends);
+  CHECK(sd1.friends.size() == sd2.friends.size());
+
+  for (size_t i = 0; i < targets.size() / 2; ++i) {
+    CHECK(e.opt->RemoveEdge(1, targets[i]));
+    CHECK(e.base->RemoveEdge(1, targets[i]));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  auto d3 = SyncQuery(*e.opt, dge::QueryType::kDistance, 1, targets.back());
+  auto d4 = SyncQuery(*e.base, dge::QueryType::kDistance, 1, targets.back());
+  CHECK(d3.distance == d4.distance);
+  auto cf3 = SyncQuery(*e.opt, dge::QueryType::kCommonFriends, 1, targets[targets.size() - 2]);
+  auto cf4 = SyncQuery(*e.base, dge::QueryType::kCommonFriends, 1, targets[targets.size() - 2]);
+  CHECK(cf3.friends == cf4.friends);
+
+  e.opt->Shutdown();
+  e.base->Shutdown();
+}
+
 void TestConcurrentAddRemove() {
   printf("[test] concurrent updates + queries stay consistent\n");
   auto e = MakeEngines(500);
@@ -389,6 +433,7 @@ int main() {
   TestSmallTopology();
   TestRandomEquivalence(200, 12345, 200);
   TestCompaction();
+  TestMultiBlock();
   TestConcurrentAddRemove();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
