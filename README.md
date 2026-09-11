@@ -134,13 +134,33 @@ Redis（本机已编译安装于 `~/.local/bin/`，也可 `brew install redis`�
 - 指标：QPS、平均/p50/p90/p99/p999 延迟、内存占用、缓存命中率、压缩整理次数
 - Baseline 对比引擎：`std::list` 原生链表 + 每次查询 calloc+memset visited + 全局锁
 
+## 服务运行
+
+```bash
+./bin/server --nodes 300000 --port 8080          # 起服务（Multi-Reactor HTTP）
+curl -X POST 127.0.0.1:8080/query -d '{"type":"dist","a":1,"b":2}'
+curl -X POST 127.0.0.1:8080/edge -d '{"op":"add","u":1,"v":2,"dedup_key":"k1"}'  # 幂等
+curl 127.0.0.1:8080/metrics                       # Prometheus 指标
+# 持久化：--wal /path/wal.log --snapshot /path/snap.bin [--wal-sync]，kill -9 后重启自动恢复
+```
+
+## 文档
+
+- `docs/DESIGN.md` —— 架构与每个设计的取舍论证（为什么 COW 不是 RCU、为什么邻接表…）
+- `docs/PERF.md` —— 性能测量方法论与历次优化数据、火焰图工作流
+- `docs/DISTRIBUTED.md` —— 上亿节点的多机分片扩展设计（面试系统设计题素材）
+
 ## 测试
 
 ```bash
-make test   # 12757 项断言
+make test   # 16462 项断言
+make asan   # AddressSanitizer 全量回归
+make fuzz   # 随机变异解析轰炸器（ASAN，千亿次级）
+scripts/bench_regress.sh   # 基准回归（退化>5%报警）
 ```
 
 覆盖：varint 往返、Slab 分配/复用/魔数越界拦截（含野指针 next 场景）、
 线程池降载语义、定时器、O(1) 增删边语义、BFS/交集正确性、
 优化引擎与基线引擎随机图等价性（距离/共同好友/二度好友）、
-尾部扩容与压缩块重建、空洞异步整理、并发更新+查询一致性。
+尾部扩容与压缩块重建、空洞异步整理、并发更新+查询一致性、
+WAL 同步恢复、快照+WAL 组合恢复、torn write 容忍（kill -9 故障注入）。
