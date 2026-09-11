@@ -252,19 +252,19 @@ bool tail_full(const NodeAdjacency& adj) {
   return adj.tail_len >= adj.tail_cap;
 }
 
-bool node_needs_compaction(const NodeAdjacency& adj) {
+bool node_needs_compaction(const NodeAdjacency& adj, double hole_ratio_threshold) {
   if (tail_full(adj)) {
     return true;
   }
   if (adj.tail_len > 0 &&
-      static_cast<double>(adj.tail_deleted) / adj.tail_len > kHoleRatioThreshold) {
+      static_cast<double>(adj.tail_deleted) / adj.tail_len > hole_ratio_threshold) {
     return true;
   }
   uint8_t* b = adj.head;
   while (b != nullptr) {
     const BlockHeader* h = header_of(b);
     if (h->count > 0 &&
-        static_cast<double>(h->deleted) / h->count > kHoleRatioThreshold) {
+        static_cast<double>(h->deleted) / h->count > hole_ratio_threshold) {
       return true;
     }
     b = h->next;

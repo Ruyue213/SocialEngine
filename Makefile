@@ -1,7 +1,7 @@
 CXX ?= clang++
 CC ?= clang
-CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra -Isrc -Ithird_party/hiredis
-CFLAGS ?= -std=c11 -O2 -w -Ithird_party/hiredis
+CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra -Isrc -Ithird_party/hiredis -MMD -MP
+CFLAGS ?= -std=c11 -O2 -w -Ithird_party/hiredis -MMD -MP
 LDFLAGS ?= -lpthread
 
 BUILD := build
@@ -43,10 +43,10 @@ $(BIN)/tests: $(TEST_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 asan:
-	$(MAKE) CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Ithird_party/hiredis"
+	$(MAKE) CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Ithird_party/hiredis -MMD -MP"
 
 debug:
-	$(MAKE) CXXFLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc -Ithird_party/hiredis"
+	$(MAKE) CXXFLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc -Ithird_party/hiredis -MMD -MP"
 
 test: $(BIN)/tests
 	./$(BIN)/tests
@@ -56,5 +56,8 @@ bench: $(BIN)/bench
 
 clean:
 	rm -rf $(BUILD) $(BIN)
+
+DEPFILES := $(ENGINE_OBJ:.o=.d) $(HIREDIS_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+-include $(DEPFILES)
 
 .PHONY: all asan debug test bench clean

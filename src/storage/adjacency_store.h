@@ -89,7 +89,7 @@ void release_node(SlabPool& pool, NodeAdjacency& adj);
 
 bool tail_full(const NodeAdjacency& adj);
 
-bool node_needs_compaction(const NodeAdjacency& adj);
+bool node_needs_compaction(const NodeAdjacency& adj, double hole_ratio_threshold);
 
 }  // namespace storage
 }  // namespace dge

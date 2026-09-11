@@ -57,6 +57,9 @@ class DynamicGraphEngine : public IGraphEngine {
     int redis_ttl_seconds = 120;
     int double_delete_delay_ms = 5;
     uint32_t max_bfs_depth = 32;
+    size_t keep_tail_threshold = 256;
+    double hole_ratio_threshold = 0.4;
+    size_t cache_max_friends = 512;
   };
 
   explicit DynamicGraphEngine(const Config& cfg);

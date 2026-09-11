@@ -235,7 +235,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
         cache_misses_.fetch_add(1, std::memory_order_relaxed);
         WorkerCtx& ctx = *tls_worker_ctx;
         friends = SecondDegreeBfs(req->a, ctx);
-        if (friends.size() <= 512) {
+        if (friends.size() <= cfg_.cache_max_friends) {
           redis_->SetAsync(SdKey(req->a), prefix + SerializeFriends(friends));
         }
         FinishWithFriends(req, std::move(friends));
@@ -413,7 +413,7 @@ bool DynamicGraphEngine::PrepareAddToNode(uint32_t node, uint32_t id) {
     }
     std::vector<uint32_t> live;
     storage::gather_live(adj, live);
-    if (adj.block_count > 0 || live.size() > storage::kKeepTailThreshold) {
+    if (adj.block_count > 0 || live.size() > cfg_.keep_tail_threshold) {
       storage::rebuild_blocks(pool_, adj, live);
     } else {
       storage::grow_tail(pool_, adj, live);
@@ -493,10 +493,10 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
-  if (storage::node_needs_compaction(adj_[u])) {
+  if (storage::node_needs_compaction(adj_[u], cfg_.hole_ratio_threshold)) {
     MarkDirty(u);
   }
-  if (storage::node_needs_compaction(adj_[v])) {
+  if (storage::node_needs_compaction(adj_[v], cfg_.hole_ratio_threshold)) {
     MarkDirty(v);
   }
   InvalidateCache(u, v);
@@ -522,8 +522,7 @@ void DynamicGraphEngine::CompactNode(uint32_t node) {
   dirty_flags_[node].store(0, std::memory_order_relaxed);
   storage::NodeAdjacency& adj = adj_[node];
   storage::gather_live(adj, maint_scratch_);
-  if (adj.block_count > 0 ||
-      maint_scratch_.size() > storage::kKeepTailThreshold) {
+  if (adj.block_count > 0 || maint_scratch_.size() > cfg_.keep_tail_threshold) {
     storage::rebuild_blocks(pool_, adj, maint_scratch_);
   } else {
     storage::grow_tail(pool_, adj, maint_scratch_);
