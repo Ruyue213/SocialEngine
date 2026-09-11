@@ -41,7 +41,7 @@ class RedisClient {
                      std::function<void(bool, const std::string&)> cb);
 
   void EvalWriteAsync(const std::vector<std::string>& keys, const std::string& script,
-                      std::function<void()> cb = nullptr);
+                      std::function<void()> cb = nullptr, int64_t argv1 = -1);
 
   void SetNxAsync(const std::string& key, int ttl_seconds,
                   std::function<void(bool)> cb);

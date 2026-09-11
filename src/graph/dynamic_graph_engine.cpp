@@ -24,6 +24,9 @@ constexpr const char* kReadScript3 =
     "if val then\n"
     "  local prefix = v1 .. '.' .. v2 .. '.'\n"
     "  if string.sub(val, 1, string.len(prefix)) == prefix then return val end\n"
+    "  local d1 = redis.call('EXISTS', KEYS[4])\n"
+    "  local d2 = redis.call('EXISTS', KEYS[5])\n"
+    "  if (d1 + d2) > 0 then return val .. '|stale' end\n"
     "end\n"
     "return v1 .. '.' .. v2 .. '.'";
 
@@ -33,6 +36,8 @@ constexpr const char* kReadScript2 =
     "if val then\n"
     "  local prefix = v1 .. '.'\n"
     "  if string.sub(val, 1, string.len(prefix)) == prefix then return val end\n"
+    "  local d1 = redis.call('EXISTS', KEYS[3])\n"
+    "  if d1 > 0 then return val .. '|stale' end\n"
     "end\n"
     "return v1 .. '.'";
 
@@ -40,6 +45,8 @@ constexpr const char* kInvalidateScript =
     "redis.call('INCR', KEYS[1])\n"
     "redis.call('INCR', KEYS[2])\n"
     "redis.call('DEL', KEYS[3], KEYS[4], KEYS[5], KEYS[6])\n"
+    "redis.call('PSETEX', KEYS[7], ARGV[1], '1')\n"
+    "redis.call('PSETEX', KEYS[8], ARGV[1], '1')\n"
     "return 1";
 
 constexpr const char* kDelScript =
@@ -47,14 +54,19 @@ constexpr const char* kDelScript =
     "return 1";
 
 void SplitPayload(const std::string& value, std::string& prefix, std::string& payload) {
-  size_t dot = value.rfind('.');
+  std::string v = value;
+  size_t mark = v.find("|stale");
+  if (mark != std::string::npos) {
+    v.erase(mark);
+  }
+  size_t dot = v.rfind('.');
   if (dot == std::string::npos) {
     prefix.clear();
-    payload = value;
+    payload = v;
     return;
   }
-  prefix = value.substr(0, dot + 1);
-  payload = value.substr(dot + 1);
+  prefix = v.substr(0, dot + 1);
+  payload = v.substr(dot + 1);
 }
 
 bool ParseInt(const std::string& s, int32_t& out) {
@@ -196,7 +208,8 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
     case QueryType::kDistance: {
       uint32_t lo = std::min(a, b);
       uint32_t hi = std::max(a, b);
-      std::vector<std::string> keys = {VersionKey(a), VersionKey(b), DistKey(lo, hi)};
+      std::vector<std::string> keys = {VersionKey(a), VersionKey(b), DistKey(lo, hi),
+                                      DirtyKey(a), DirtyKey(b)};
       redis_->EvalReadAsync(keys, kReadScript3,
                             [this, req](bool ok, const std::string& value) {
         std::string prefix;
@@ -222,7 +235,8 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
     case QueryType::kCommonFriends: {
       uint32_t lo = std::min(a, b);
       uint32_t hi = std::max(a, b);
-      std::vector<std::string> keys = {VersionKey(a), VersionKey(b), CfKey(lo, hi)};
+      std::vector<std::string> keys = {VersionKey(a), VersionKey(b), CfKey(lo, hi),
+                                      DirtyKey(a), DirtyKey(b)};
       redis_->EvalReadAsync(keys, kReadScript3,
                             [this, req](bool ok, const std::string& value) {
         std::string prefix;
@@ -249,7 +263,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
       return;
     }
     case QueryType::kSecondDegree: {
-      std::vector<std::string> keys = {VersionKey(a), SdKey(a)};
+      std::vector<std::string> keys = {VersionKey(a), SdKey(a), DirtyKey(a)};
       redis_->EvalReadAsync(keys, kReadScript2,
                             [this, req](bool ok, const std::string& value) {
         std::string prefix;
@@ -647,8 +661,9 @@ void DynamicGraphEngine::InvalidateCache(uint32_t u, uint32_t v) {
   uint32_t lo = std::min(u, v);
   uint32_t hi = std::max(u, v);
   std::vector<std::string> keys = {VersionKey(u), VersionKey(v), DistKey(lo, hi),
-                                   CfKey(lo, hi), SdKey(u), SdKey(v)};
-  redis_->EvalWriteAsync(keys, kInvalidateScript);
+                                   CfKey(lo, hi), SdKey(u), SdKey(v), DirtyKey(u), DirtyKey(v)};
+  redis_->EvalWriteAsync(keys, kInvalidateScript, nullptr,
+                         static_cast<int>(cfg_.dirty_window_ms));
   std::vector<std::string> del_keys = {DistKey(lo, hi), CfKey(lo, hi), SdKey(u), SdKey(v)};
   timer_.Add(cfg_.double_delete_delay_ms, [this, del_keys]() {
     redis_->EvalWriteAsync(del_keys, kDelScript);
@@ -671,6 +686,10 @@ std::string DynamicGraphEngine::SdKey(uint32_t u) const {
 
 std::string DynamicGraphEngine::VersionKey(uint32_t u) const {
   return cfg_.cache_namespace + "v:" + std::to_string(u);
+}
+
+std::string DynamicGraphEngine::DirtyKey(uint32_t u) const {
+  return cfg_.cache_namespace + "dirty:" + std::to_string(u);
 }
 
 std::string DynamicGraphEngine::SerializeFriends(const std::vector<uint32_t>& f) {

@@ -61,6 +61,7 @@ class DynamicGraphEngine : public IGraphEngine {
     size_t keep_tail_threshold = 256;
     double hole_ratio_threshold = 0.4;
     size_t cache_max_friends = 512;
+    int dirty_window_ms = 100;
     std::string cache_namespace;
     std::string wal_path;
     bool wal_sync_mode = false;
@@ -138,6 +139,7 @@ class DynamicGraphEngine : public IGraphEngine {
   std::string CfKey(uint32_t u, uint32_t v) const;
   std::string SdKey(uint32_t u) const;
   std::string VersionKey(uint32_t u) const;
+  std::string DirtyKey(uint32_t u) const;
   std::string SerializeFriends(const std::vector<uint32_t>& f);
   bool ParseFriends(const std::string& s, std::vector<uint32_t>& out);
 

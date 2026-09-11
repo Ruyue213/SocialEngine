@@ -96,6 +96,10 @@ bool RedisClient::AppendCommand(redisContext* ctx, Op& op, std::string& sha) {
   size_t s4 = op.keys.size() > 4 ? op.keys[4].size() : 0;
   const char* k5 = op.keys.size() > 5 ? op.keys[5].data() : "";
   size_t s5 = op.keys.size() > 5 ? op.keys[5].size() : 0;
+  const char* k6 = op.keys.size() > 6 ? op.keys[6].data() : "";
+  size_t s6 = op.keys.size() > 6 ? op.keys[6].size() : 0;
+  const char* k7 = op.keys.size() > 7 ? op.keys[7].data() : "";
+  size_t s7 = op.keys.size() > 7 ? op.keys[7].size() : 0;
   switch (op.type) {
     case Op::Type::kGet:
       redisAppendCommand(ctx, "GET %s", op.key.c_str());
@@ -110,12 +114,24 @@ bool RedisClient::AppendCommand(redisContext* ctx, Op& op, std::string& sha) {
     case Op::Type::kIncr:
       redisAppendCommand(ctx, "INCR %s", op.key.c_str());
       return true;
-    case Op::Type::kEvalRead:
-    case Op::Type::kEvalWrite: {
+    case Op::Type::kEvalRead: {
       sha = sha1_hex(op.script);
       redisAppendCommand(ctx, "EVALSHA %s %d %b %b %b %b %b %b", sha.c_str(),
                          static_cast<int>(op.keys.size()), k0, s0, k1, s1, k2, s2, k3, s3,
                          k4, s4, k5, s5);
+      return true;
+    }
+    case Op::Type::kEvalWrite: {
+      sha = sha1_hex(op.script);
+      if (op.value.empty()) {
+        redisAppendCommand(ctx, "EVALSHA %s %d %b %b %b %b %b %b %b %b", sha.c_str(),
+                           static_cast<int>(op.keys.size()), k0, s0, k1, s1, k2, s2, k3, s3,
+                           k4, s4, k5, s5, "", 0, "", 0);
+      } else {
+        redisAppendCommand(ctx, "EVALSHA %s %d %b %b %b %b %b %b %b %b %b", sha.c_str(),
+                           static_cast<int>(op.keys.size()), k0, s0, k1, s1, k2, s2, k3, s3,
+                           k4, s4, k5, s5, k6, s6, k7, s7, op.value.data(), op.value.size());
+      }
       return true;
     }
     case Op::Type::kEvalResult: {
@@ -318,6 +334,19 @@ void RedisClient::IoLoop(size_t idx) {
             batch[i].keys.size() > 0 ? batch[i].keys[0].data() : "",
             batch[i].keys.size() > 0 ? batch[i].keys[0].size() : 0, batch[i].value.data(),
             batch[i].value.size()));
+      } else if (batch[i].type == Op::Type::kEvalWrite && !batch[i].value.empty()) {
+        r = static_cast<redisReply*>(redisCommand(
+            ctx, "EVAL %s %d %b %b %b %b %b %b %b %b %b", batch[i].script.c_str(),
+            static_cast<int>(batch[i].keys.size()),
+            batch[i].keys.size() > 0 ? batch[i].keys[0].data() : "", batch[i].keys.size() > 0 ? batch[i].keys[0].size() : 0,
+            batch[i].keys.size() > 1 ? batch[i].keys[1].data() : "", batch[i].keys.size() > 1 ? batch[i].keys[1].size() : 0,
+            batch[i].keys.size() > 2 ? batch[i].keys[2].data() : "", batch[i].keys.size() > 2 ? batch[i].keys[2].size() : 0,
+            batch[i].keys.size() > 3 ? batch[i].keys[3].data() : "", batch[i].keys.size() > 3 ? batch[i].keys[3].size() : 0,
+            batch[i].keys.size() > 4 ? batch[i].keys[4].data() : "", batch[i].keys.size() > 4 ? batch[i].keys[4].size() : 0,
+            batch[i].keys.size() > 5 ? batch[i].keys[5].data() : "", batch[i].keys.size() > 5 ? batch[i].keys[5].size() : 0,
+            batch[i].keys.size() > 6 ? batch[i].keys[6].data() : "", batch[i].keys.size() > 6 ? batch[i].keys[6].size() : 0,
+            batch[i].keys.size() > 7 ? batch[i].keys[7].data() : "", batch[i].keys.size() > 7 ? batch[i].keys[7].size() : 0,
+            batch[i].value.data(), batch[i].value.size()));
       } else {
         r = static_cast<redisReply*>(redisCommand(
             ctx, "EVAL %s %d %b %b %b %b %b %b", batch[i].script.c_str(),
@@ -421,7 +450,7 @@ void RedisClient::EvalReadAsync(const std::vector<std::string>& keys,
 
 void RedisClient::EvalWriteAsync(const std::vector<std::string>& keys,
                                  const std::string& script,
-                                 std::function<void()> cb) {
+                                 std::function<void()> cb, int64_t argv1) {
   if (!enabled_.load(std::memory_order_relaxed) || stop_) {
     if (cb) {
       schedule_(std::move(cb));
@@ -432,6 +461,7 @@ void RedisClient::EvalWriteAsync(const std::vector<std::string>& keys,
   op.type = Op::Type::kEvalWrite;
   op.keys = keys;
   op.script = script;
+  op.value = argv1 >= 0 ? std::to_string(argv1) : "";
   op.done_cb = std::move(cb);
   size_t idx = rr_.fetch_add(1, std::memory_order_relaxed) % io_queues_.size();
   EnqueueWrite(idx, std::move(op));

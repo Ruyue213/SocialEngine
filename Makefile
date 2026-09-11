@@ -55,6 +55,11 @@ $(BIN)/server: $(SERVER_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
 asan:
 	$(MAKE) CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Ithird_party/hiredis -MMD -MP"
 
+fuzz:
+	clang++ -std=c++17 -O1 -g -fsanitize=address,undefined -Isrc tests/parse_hammer.cpp \
+	    src/net/http.cpp -o $(BIN)/parse_hammer
+	./$(BIN)/parse_hammer
+
 debug:
 	$(MAKE) CXXFLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc -Ithird_party/hiredis -MMD -MP"
 
