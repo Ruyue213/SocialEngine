@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -15,8 +16,6 @@ static constexpr size_t kBlockHeaderSize = 24;
 static constexpr size_t kBlockPayload = kBlockSize - kBlockHeaderSize;
 static constexpr uint32_t kBlockMagic = 0x0B10C0DEu;
 static constexpr uint64_t kDeletedTail = 0xFFFFFFFFFFFFFFFFULL;
-static constexpr size_t kKeepTailThreshold = 256;
-static constexpr double kHoleRatioThreshold = 0.4;
 static constexpr size_t kMaxVarint = 5;
 
 struct BlockHeader {
@@ -27,13 +26,18 @@ struct BlockHeader {
   uint32_t magic;
 };
 
-struct NodeAdjacency {
+struct AdjacencyData {
   uint8_t* head;
-  uint32_t block_count;
-  uint32_t tail_cap;
-  uint32_t tail_len;
-  uint32_t tail_deleted;
   uint64_t* tail;
+  std::atomic<uint32_t> cap{0};
+  std::atomic<uint32_t> len{0};
+  std::atomic<uint32_t> deleted{0};
+  uint32_t pad;
+};
+
+struct NodeAdjacency {
+  std::atomic<AdjacencyData*> data{nullptr};
+  uint32_t block_count = 0;
 };
 
 static_assert(sizeof(BlockHeader) == 24, "BlockHeader must be 24 bytes");
@@ -60,21 +64,22 @@ size_t block_free_space(const uint8_t* block);
 
 uint32_t block_append(uint8_t* block, uint64_t delta);
 
-void block_iterate(const uint8_t* block,
-                   const std::function<void(uint32_t)>& fn);
+void block_iterate(const uint8_t* block, const std::function<void(uint32_t)>& fn);
 
-bool block_remove(uint8_t* block, uint32_t id, bool& found);
+bool block_remove(SlabPool& pool, NodeAdjacency& adj, uint32_t id, bool& found);
 
 enum class TailAddResult { kAdded, kDuplicate, kFull };
 
-TailAddResult tail_add(NodeAdjacency& adj, uint64_t id);
+TailAddResult tail_add(SlabPool& pool, NodeAdjacency& adj, uint64_t id);
 
-bool tail_remove(NodeAdjacency& adj, uint64_t id);
+bool tail_remove(SlabPool& pool, NodeAdjacency& adj, uint64_t id);
 
 bool tail_contains(const NodeAdjacency& adj, uint64_t id);
 
-void node_iterate(const NodeAdjacency& adj,
+void node_iterate(uint8_t* head, const uint64_t* tail, uint32_t tail_len,
                   const std::function<void(uint32_t)>& fn);
+
+void node_iterate(const NodeAdjacency& adj, const std::function<void(uint32_t)>& fn);
 
 size_t node_live_count(const NodeAdjacency& adj);
 

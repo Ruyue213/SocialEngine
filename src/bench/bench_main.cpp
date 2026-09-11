@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include "common/affinity.h"
 #include "graph/dynamic_graph_engine.h"
+#include "memory/epoch.h"
 #include "graph/engine_interface.h"
 
 using namespace dge;
@@ -513,7 +514,8 @@ void PrintStats(IGraphEngine& engine, BenchCtx& ctx, int seconds, const char* la
            static_cast<unsigned long long>(s.compactions),
            static_cast<unsigned long long>(s.maintenance_scans));
   }
-  printf("  memory            : %.1f MB\n", s.memory_bytes / 1024.0 / 1024.0);
+  printf("  memory            : %.1f MB (pending retire: %llu)\n", s.memory_bytes / 1024.0 / 1024.0,
+         static_cast<unsigned long long>(dge::EpochReclaimer::Instance().retired_pending()));
   PrintLatency(ctx, "latency");
 }
 

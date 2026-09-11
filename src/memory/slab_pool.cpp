@@ -160,6 +160,17 @@ void SlabPool::Deallocate(void* p, size_t size) {
   }
   std::lock_guard<std::mutex> lk(cls->mu);
   uint8_t* b = static_cast<uint8_t*>(p);
+#ifdef DGE_VERIFY
+  void* walk = cls->free_head;
+  int guard = 0;
+  while (walk != nullptr && guard < 100000) {
+    if (walk == p) {
+      throw std::runtime_error("SlabPool: double free detected");
+    }
+    walk = reinterpret_cast<void*>(load_u64(walk));
+    ++guard;
+  }
+#endif
   store_u64(b, reinterpret_cast<uint64_t>(cls->free_head));
   if (cls->slot >= 16) {
     store_u64(b + 8, kFreeMagic);

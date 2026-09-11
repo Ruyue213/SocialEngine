@@ -1,6 +1,7 @@
 #include "graph/dynamic_graph_engine.h"
 
 #include "common/metrics.h"
+#include "memory/epoch.h"
 
 #include <algorithm>
 #include <chrono>
@@ -116,7 +117,8 @@ DynamicGraphEngine::DynamicGraphEngine(const Config& cfg)
       dirty_flags_(cfg.nodes + 1),
       worker_ctxs_(MakeWorkerCtxs(ResolvePoolThreads(cfg), cfg.nodes)),
       workers_(ResolvePoolThreads(cfg), cfg.queue_capacity ? cfg.queue_capacity : 4096,
-            cfg.pin_threads, 1, [this](size_t i) { tls_worker_ctx = &worker_ctxs_[i]; }) {
+            cfg.pin_threads, 1,
+            [this](size_t i) { tls_worker_ctx = &worker_ctxs_[i]; }) {
   if (cfg_.cache_namespace.empty()) {
     cfg_.cache_namespace =
         "g" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
@@ -172,6 +174,7 @@ bool DynamicGraphEngine::Submit(QueryRequest&& req) {
 
 void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) {
   WorkerCtx& ctx = *tls_worker_ctx;
+  req->epoch_ticket = EpochReclaimer::Instance().Pin();
   if (!redis_ || !redis_->enabled()) {
     switch (req->type) {
       case QueryType::kDistance:
@@ -275,6 +278,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
 
 void DynamicGraphEngine::FinishWithDistance(const std::shared_ptr<QueryRequest>& req,
                                             int32_t dist) {
+  EpochReclaimer::Instance().Unpin(req->epoch_ticket);
   QueryResult res;
   res.distance = dist;
   queries_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -293,6 +297,7 @@ void DynamicGraphEngine::FinishWithDistance(const std::shared_ptr<QueryRequest>&
 
 void DynamicGraphEngine::FinishWithFriends(const std::shared_ptr<QueryRequest>& req,
                                            std::vector<uint32_t> friends) {
+  EpochReclaimer::Instance().Unpin(req->epoch_ticket);
   QueryResult res;
   res.friends = std::move(friends);
   queries_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -406,24 +411,22 @@ std::vector<uint32_t> DynamicGraphEngine::CommonFriends(uint32_t u, uint32_t v,
                                                         WorkerCtx& ctx) {
   std::vector<uint32_t>& sa = ctx.scratch;
   std::vector<uint32_t>& sb = ctx.scratch2;
-  if (u == v) {
-    std::shared_lock<std::shared_mutex> lk(buckets_[BucketOf(u)].mu);
-    storage::gather_live(adj_[u], sa);
-    return sa;
+  storage::NodeAdjacency& au = adj_[u];
+  storage::NodeAdjacency& av = adj_[v];
+  const storage::AdjacencyData* du = au.data.load(std::memory_order_acquire);
+  const storage::AdjacencyData* dv = av.data.load(std::memory_order_acquire);
+  sa.clear();
+  if (du != nullptr) {
+    storage::node_iterate(du->head, du->tail, du->len.load(std::memory_order_acquire),
+                          [&sa](uint32_t id) { sa.push_back(id); });
   }
-  size_t b1 = BucketOf(u);
-  size_t b2 = BucketOf(v);
-  if (b1 > b2) {
-    std::swap(b1, b2);
-    std::swap(u, v);
+  sb.clear();
+  if (dv != nullptr) {
+    storage::node_iterate(dv->head, dv->tail, dv->len.load(std::memory_order_acquire),
+                          [&sb](uint32_t id) { sb.push_back(id); });
   }
-  std::shared_lock<std::shared_mutex> lk1(buckets_[b1].mu);
-  std::shared_lock<std::shared_mutex> lk2(buckets_[b2].mu, std::defer_lock);
-  if (b2 != b1) {
-    lk2.lock();
-  }
-  storage::gather_live(adj_[u], sa);
-  storage::gather_live(adj_[v], sb);
+  std::sort(sa.begin(), sa.end());
+  std::sort(sb.begin(), sb.end());
   std::vector<uint32_t> out;
   out.resize(std::min(sa.size(), sb.size()));
   size_t n = IntersectSorted(sa.data(), sa.size(), sb.data(), sb.size(), out.data());
@@ -433,15 +436,17 @@ std::vector<uint32_t> DynamicGraphEngine::CommonFriends(uint32_t u, uint32_t v,
 
 void DynamicGraphEngine::ForEachNeighbor(uint32_t u,
                                          const std::function<void(uint32_t)>& fn) {
-  Bucket& b = buckets_[BucketOf(u)];
-  std::shared_lock<std::shared_mutex> lk(b.mu);
-  storage::node_iterate(adj_[u], fn);
+  storage::NodeAdjacency& adj = adj_[u];
+  const storage::AdjacencyData* d = adj.data.load(std::memory_order_acquire);
+  if (d != nullptr) {
+    storage::node_iterate(d->head, d->tail, d->len.load(std::memory_order_acquire), fn);
+  }
 }
 
 bool DynamicGraphEngine::PrepareAddToNode(uint32_t node, uint32_t id) {
   storage::NodeAdjacency& adj = adj_[node];
   for (int attempt = 0; attempt < 2; ++attempt) {
-    storage::TailAddResult r = storage::tail_add(adj, id);
+    storage::TailAddResult r = storage::tail_add(pool_, adj, id);
     if (r == storage::TailAddResult::kDuplicate) {
       return false;
     }
@@ -455,8 +460,7 @@ bool DynamicGraphEngine::PrepareAddToNode(uint32_t node, uint32_t id) {
       if (live[k] == live[k - 1]) {
         fprintf(stderr,
                 "PRE-REBUILD DUP in PrepareAddToNode(node=%u, id=%u): live[%zu]=%u size=%zu "
-                "block_count=%u tail_len=%u\n",
-                node, id, k, live[k], live.size(), adj.block_count, adj.tail_len);
+                "block_count=%u\n", node, id, k, live[k], live.size(), adj.block_count);
         exit(4);
       }
     }
@@ -503,7 +507,7 @@ bool DynamicGraphEngine::AddEdge(uint32_t u, uint32_t v) {
     return false;
   }
   if (!PrepareAddToNode(v, u)) {
-    storage::tail_remove(adj_[u], v);
+    storage::tail_remove(pool_, adj_[u], v);
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
@@ -547,27 +551,13 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
     lk2.lock();
   }
 
-  bool found_u = storage::tail_remove(adj_[u], v);
+  bool found_u = storage::tail_remove(pool_, adj_[u], v);
   if (!found_u) {
-    uint8_t* blk = adj_[u].head;
-    while (blk != nullptr && !found_u) {
-      bool cont = storage::block_remove(blk, v, found_u);
-      if (!cont) {
-        break;
-      }
-      blk = storage::header_of(blk)->next;
-    }
+    storage::block_remove(pool_, adj_[u], v, found_u);
   }
-  bool found_v = storage::tail_remove(adj_[v], u);
+  bool found_v = storage::tail_remove(pool_, adj_[v], u);
   if (!found_v) {
-    uint8_t* blk = adj_[v].head;
-    while (blk != nullptr && !found_v) {
-      bool cont = storage::block_remove(blk, u, found_v);
-      if (!cont) {
-        break;
-      }
-      blk = storage::header_of(blk)->next;
-    }
+    storage::block_remove(pool_, adj_[v], u, found_v);
   }
   bool found = found_u || found_v;
   if (!found) {
@@ -623,7 +613,7 @@ void DynamicGraphEngine::MaintenanceLoop() {
   while (true) {
     {
       std::unique_lock<std::mutex> lk(maint_mu_);
-      maint_cv_.wait_for(lk, std::chrono::milliseconds(50),
+      maint_cv_.wait_for(lk, std::chrono::milliseconds(5),
                          [this] { return maint_stop_; });
       if (maint_stop_) {
         return;
@@ -635,6 +625,7 @@ void DynamicGraphEngine::MaintenanceLoop() {
       batch.insert(batch.end(), b.dirty.begin(), b.dirty.end());
       b.dirty.clear();
     }
+    EpochReclaimer::Instance().Sweep();
     if (batch.empty()) {
       continue;
     }
@@ -644,6 +635,7 @@ void DynamicGraphEngine::MaintenanceLoop() {
         CompactNode(node);
       }
     }
+    EpochReclaimer::Instance().Sweep();
   }
 }
 
@@ -818,6 +810,7 @@ void DynamicGraphEngine::Shutdown() {
     redis_->Shutdown();
   }
   workers_.Shutdown();
+  EpochReclaimer::Instance().DrainPool(&pool_);
 }
 
 }  // namespace dge
