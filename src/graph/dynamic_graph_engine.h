@@ -17,6 +17,7 @@
 #include "graph/engine_interface.h"
 #include "memory/slab_pool.h"
 #include "storage/adjacency_store.h"
+#include "storage/wal.h"
 
 namespace dge {
 
@@ -61,6 +62,10 @@ class DynamicGraphEngine : public IGraphEngine {
     double hole_ratio_threshold = 0.4;
     size_t cache_max_friends = 512;
     std::string cache_namespace;
+    std::string wal_path;
+    bool wal_sync_mode = false;
+    std::string snapshot_path;
+    size_t wal_checkpoint_bytes = 64 * 1024 * 1024;
   };
 
   explicit DynamicGraphEngine(const Config& cfg);
@@ -79,6 +84,15 @@ class DynamicGraphEngine : public IGraphEngine {
 
   void DedupCheck(const std::string& key, int ttl_seconds,
                   std::function<void(bool)> cb);
+
+  bool Recover();
+  bool WriteSnapshot();
+  void RotateWal() {
+    if (wal_) {
+      wal_->Rotate();
+    }
+  }
+  void SetWalEnabled(bool on) { wal_enabled_.store(on, std::memory_order_relaxed); }
 
   void SetCacheInvalidation(bool on) {
     cache_invalidation_.store(on, std::memory_order_relaxed);
@@ -153,6 +167,9 @@ class DynamicGraphEngine : public IGraphEngine {
   std::atomic<uint64_t> maintenance_scans_{0};
   std::atomic<bool> shutdown_{false};
   std::atomic<bool> cache_invalidation_{true};
+  std::atomic<bool> recovering_{false};
+  std::atomic<bool> wal_enabled_{true};
+  std::unique_ptr<WalWriter> wal_;
 };
 
 }  // namespace dge

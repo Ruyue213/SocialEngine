@@ -136,6 +136,15 @@ DynamicGraphEngine::DynamicGraphEngine(const Config& cfg)
           }
         });
   }
+  if (!cfg_.wal_path.empty()) {
+    wal_ = std::make_unique<WalWriter>(
+        cfg_.wal_path, cfg_.wal_sync_mode, cfg_.wal_checkpoint_bytes,
+        [this]() {
+          if (WriteSnapshot()) {
+            wal_->Rotate();
+          }
+        });
+  }
   maint_thread_ = std::thread([this]() { MaintenanceLoop(); });
 }
 
@@ -499,6 +508,10 @@ bool DynamicGraphEngine::AddEdge(uint32_t u, uint32_t v) {
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_updates_total");
+  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
+      !recovering_.load(std::memory_order_relaxed)) {
+    wal_->Append(0x01, u, v);
+  }
 #ifdef DGE_VERIFY
   {
     for (uint32_t node : {u, v}) {
@@ -562,6 +575,10 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_updates_total");
+  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
+      !recovering_.load(std::memory_order_relaxed)) {
+    wal_->Append(0x02, u, v);
+  }
   if (storage::node_needs_compaction(adj_[u], cfg_.hole_ratio_threshold)) {
     MarkDirty(u);
   }
@@ -713,6 +730,47 @@ void DynamicGraphEngine::DedupCheck(const std::string& key, int ttl_seconds,
     return;
   }
   redis_->SetNxAsync(key, ttl_seconds, std::move(cb));
+}
+
+bool DynamicGraphEngine::WriteSnapshot() {
+  if (cfg_.snapshot_path.empty() || !wal_) {
+    return false;
+  }
+  uint64_t lsn = wal_->last_seq();
+  bool ok = WriteSnapshotFile(
+      cfg_.snapshot_path, lsn, [this](const std::function<void(uint64_t, uint64_t)>& emit) {
+        for (uint32_t u = 1; u <= nodes_; ++u) {
+          Bucket& b = buckets_[BucketOf(u)];
+          std::shared_lock<std::shared_mutex> lk(b.mu);
+          storage::NodeAdjacency& adj = adj_[u];
+          storage::node_iterate(adj, [&](uint32_t v) {
+            if (u < v) {
+              emit(u, v);
+            }
+          });
+        }
+        return true;
+      });
+  metrics::Inc("engine_snapshots_total");
+  return ok;
+}
+
+bool DynamicGraphEngine::Recover() {
+  if (cfg_.wal_path.empty()) {
+    return true;
+  }
+  recovering_.store(true, std::memory_order_relaxed);
+  bool ok = RecoverFromWal(cfg_.wal_path, cfg_.snapshot_path,
+                           [this](uint8_t op, uint64_t u, uint64_t v) {
+                             if (op == 0x01) {
+                               AddEdge(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+                             } else {
+                               RemoveEdge(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+                             }
+                           });
+  recovering_.store(false, std::memory_order_relaxed);
+  metrics::Inc("engine_recoveries_total");
+  return ok;
 }
 
 EngineStats DynamicGraphEngine::stats() const {

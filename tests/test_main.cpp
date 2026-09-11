@@ -16,6 +16,7 @@
 #include "graph/intersect.h"
 #include "memory/slab_pool.h"
 #include "storage/adjacency_store.h"
+#include "storage/wal.h"
 
 namespace {
 
@@ -373,6 +374,201 @@ void TestMultiBlock() {
   e.base->Shutdown();
 }
 
+void TestWalSyncRecovery() {
+  printf("[test] wal sync mode crash recovery\n");
+  const char* dir = "/tmp/dge_wal_test";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  std::string snap_path = std::string(dir) + "/snap.bin";
+
+  auto make_engine = [&](bool with_wal) {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 500;
+    cfg.buckets = 8;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    if (with_wal) {
+      cfg.wal_path = wal_path;
+      cfg.wal_sync_mode = true;
+      cfg.snapshot_path = snap_path;
+    }
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  dge::BaselineGraphEngine::Config bc;
+  bc.nodes = 500;
+  bc.pool_threads = 2;
+  dge::BaselineGraphEngine base(bc);
+
+  std::mt19937_64 rng(777);
+  std::vector<std::pair<uint32_t, uint32_t>> ops;
+  auto eng = make_engine(true);
+  for (int i = 0; i < 300; ++i) {
+    uint32_t u = 1 + rng() % 500;
+    uint32_t v = 1 + rng() % 500;
+    if (u == v) {
+      continue;
+    }
+    bool add = (i % 3) != 0;
+    if (add) {
+      eng->AddEdge(u, v);
+      base.AddEdge(u, v);
+      ops.emplace_back(0, i);
+    } else {
+      eng->RemoveEdge(u, v);
+      base.RemoveEdge(u, v);
+      ops.emplace_back(1, i);
+    }
+  }
+  eng->Shutdown();
+
+  auto rec = make_engine(false);
+  CHECK(rec->Recover());
+  for (int i = 0; i < 100; ++i) {
+    uint32_t u = 1 + rng() % 500;
+    uint32_t v = 1 + rng() % 500;
+    if (u == v) {
+      continue;
+    }
+    auto d1 = SyncQuery(*rec, dge::QueryType::kDistance, u, v);
+    auto d2 = SyncQuery(base, dge::QueryType::kDistance, u, v);
+    if (d1.distance != d2.distance) {
+      printf("  wal recovery dist mismatch %u-%u: %d vs %d\n", u, v, d1.distance, d2.distance);
+      CHECK(false);
+      break;
+    }
+    auto c1 = SyncQuery(*rec, dge::QueryType::kCommonFriends, u, v);
+    auto c2 = SyncQuery(base, dge::QueryType::kCommonFriends, u, v);
+    if (c1.friends != c2.friends) {
+      printf("  wal recovery cf mismatch %u-%u\n", u, v);
+      CHECK(false);
+      break;
+    }
+  }
+  rec->Shutdown();
+  base.Shutdown();
+}
+
+void TestWalSnapshotRecovery() {
+  printf("[test] wal + snapshot recovery\n");
+  const char* dir = "/tmp/dge_wal_test2";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  std::string snap_path = std::string(dir) + "/snap.bin";
+
+  auto make_engine = [&]() {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 500;
+    cfg.buckets = 8;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    cfg.wal_path = wal_path;
+    cfg.wal_sync_mode = true;
+    cfg.snapshot_path = snap_path;
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  dge::BaselineGraphEngine::Config bc;
+  bc.nodes = 500;
+  bc.pool_threads = 2;
+  dge::BaselineGraphEngine base(bc);
+
+  std::mt19937_64 rng(888);
+  auto eng = make_engine();
+  for (int i = 0; i < 150; ++i) {
+    uint32_t u = 1 + rng() % 500;
+    uint32_t v = 1 + rng() % 500;
+    if (u == v) {
+      continue;
+    }
+    eng->AddEdge(u, v);
+    base.AddEdge(u, v);
+  }
+  CHECK(eng->WriteSnapshot());
+  eng->RotateWal();
+  for (int i = 0; i < 100; ++i) {
+    uint32_t u = 1 + rng() % 500;
+    uint32_t v = 1 + rng() % 500;
+    if (u == v) {
+      continue;
+    }
+    if (i % 2 == 0) {
+      eng->AddEdge(u, v);
+      base.AddEdge(u, v);
+    } else {
+      eng->RemoveEdge(u, v);
+      base.RemoveEdge(u, v);
+    }
+  }
+  eng->Shutdown();
+
+  auto rec = make_engine();
+  CHECK(rec->Recover());
+  for (int i = 0; i < 100; ++i) {
+    uint32_t u = 1 + rng() % 500;
+    uint32_t v = 1 + rng() % 500;
+    if (u == v) {
+      continue;
+    }
+    auto d1 = SyncQuery(*rec, dge::QueryType::kDistance, u, v);
+    auto d2 = SyncQuery(base, dge::QueryType::kDistance, u, v);
+    if (d1.distance != d2.distance) {
+      printf("  wal+snapshot recovery dist mismatch %u-%u: %d vs %d\n", u, v, d1.distance,
+             d2.distance);
+      CHECK(false);
+      break;
+    }
+  }
+  rec->Shutdown();
+  base.Shutdown();
+}
+
+void TestWalTornWrite() {
+  printf("[test] wal torn write tolerance\n");
+  const char* dir = "/tmp/dge_wal_test3";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+
+  auto make_engine = [&]() {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 200;
+    cfg.buckets = 8;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    cfg.wal_path = wal_path;
+    cfg.wal_sync_mode = true;
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  dge::BaselineGraphEngine::Config bc;
+  bc.nodes = 200;
+  bc.pool_threads = 2;
+  dge::BaselineGraphEngine base(bc);
+
+  auto eng = make_engine();
+  for (uint32_t v = 2; v <= 60; ++v) {
+    eng->AddEdge(1, v);
+    base.AddEdge(1, v);
+  }
+  eng->Shutdown();
+
+  std::fstream f(wal_path, std::ios::binary | std::ios::in | std::ios::out);
+  f.seekp(0, std::ios::end);
+  auto size = f.tellp();
+  f.seekp(static_cast<std::streamoff>(size) - 10, std::ios::beg);
+  f.write("XXXXXXXXXX", 10);
+  f.close();
+
+  auto rec = make_engine();
+  CHECK(rec->Recover());
+  auto d1 = SyncQuery(*rec, dge::QueryType::kDistance, 1, 59);
+  CHECK(d1.distance == 1);
+  auto d2 = SyncQuery(*rec, dge::QueryType::kDistance, 1, 60);
+  CHECK(d2.distance == -1);
+  rec->Shutdown();
+  base.Shutdown();
+}
+
 void TestConcurrentAddRemove() {
   printf("[test] concurrent updates + queries stay consistent\n");
   auto e = MakeEngines(500);
@@ -434,6 +630,9 @@ int main() {
   TestRandomEquivalence(200, 12345, 200);
   TestCompaction();
   TestMultiBlock();
+  TestWalSyncRecovery();
+  TestWalSnapshotRecovery();
+  TestWalTornWrite();
   TestConcurrentAddRemove();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);

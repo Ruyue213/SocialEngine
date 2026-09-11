@@ -36,6 +36,10 @@ void Usage() {
       "  --redis H:P       Redis地址 (default 127.0.0.1:6379)\n"
       "  --io N            Redis I/O线程数 (default 4)\n"
       "  --dedup-ttl S     幂等去重键TTL秒 (default 60)\n"
+      "  --wal P           WAL文件路径 (default 关闭)\n"
+      "  --snapshot P      快照文件路径\n"
+      "  --wal-sync        WAL同步fsync模式 (default 组提交)\n"
+      "  --wal-checkpoint B WAL触发快照字节阈值 (default 64MB)\n"
       "  --seed S          建图随机种子 (default 42)\n");
 }
 
@@ -55,6 +59,10 @@ int main(int argc, char** argv) {
   int io_threads = 4;
   int dedup_ttl = 60;
   uint64_t seed = 42;
+  std::string wal_path;
+  std::string snapshot_path;
+  bool wal_sync = false;
+  size_t wal_checkpoint = 64 * 1024 * 1024;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -92,6 +100,14 @@ int main(int argc, char** argv) {
       io_threads = atoi(need(a));
     } else if (a == "--dedup-ttl") {
       dedup_ttl = atoi(need(a));
+    } else if (a == "--wal") {
+      wal_path = need(a);
+    } else if (a == "--snapshot") {
+      snapshot_path = need(a);
+    } else if (a == "--wal-sync") {
+      wal_sync = true;
+    } else if (a == "--wal-checkpoint") {
+      wal_checkpoint = strtoull(need(a), nullptr, 10);
     } else if (a == "--seed") {
       seed = strtoull(need(a), nullptr, 10);
     } else {
@@ -111,14 +127,30 @@ int main(int argc, char** argv) {
   cfg.redis_host = cache ? redis_host : "";
   cfg.redis_port = redis_port;
   cfg.redis_io_threads = io_threads;
+  cfg.wal_path = wal_path;
+  cfg.wal_sync_mode = wal_sync;
+  cfg.snapshot_path = snapshot_path;
+  cfg.wal_checkpoint_bytes = wal_checkpoint;
   dge::DynamicGraphEngine engine(cfg);
   engine.SetCacheInvalidation(false);
+  engine.SetWalEnabled(false);
+  if (!wal_path.empty()) {
+    engine.Recover();
+    DGE_LOG_INFO("wal recovery done, graph has %llu updates",
+                 static_cast<unsigned long long>(engine.stats().updates));
+  }
   DGE_LOG_INFO("building graph: %zu nodes, degree %u", nodes, degree);
   std::vector<std::pair<uint32_t, uint32_t>> edges;
   dge::GenerateBarabasiAlbert(engine, nodes, degree, seed, edges);
   DGE_LOG_INFO("graph ready: %zu edges, memory %.1fMB", edges.size(),
                engine.stats().memory_bytes / 1024.0 / 1024.0);
   engine.SetCacheInvalidation(true);
+  if (!wal_path.empty()) {
+    engine.WriteSnapshot();
+    engine.RotateWal();
+    engine.SetWalEnabled(true);
+    DGE_LOG_INFO("bulk load snapshot done, wal enabled");
+  }
 
   dge::GraphService service(engine, dedup_ttl);
   dge::net::HttpServer server(port, reactors,
