@@ -1,0 +1,17 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "includePath": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/third_party/hiredis",
+        "${workspaceFolder}/third_party/hiredis/adapters"
+      ],
+      "defines": [],
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "clang-arm64"
+    }
+  ],
+  "version": 4
+}
