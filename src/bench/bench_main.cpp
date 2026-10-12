@@ -295,10 +295,12 @@ void ClientLoop(IGraphEngine& engine, BenchCtx& ctx, const BenchArgs& args, size
     }
     return u;
   };
-  const uint64_t cf_p = 55;
-  const uint64_t sd_p = 25;
-  const uint64_t dist_p = 10;
-  const uint64_t add_p = 5;
+  // 修复:接入 --mix 参数(原先硬编码 55/25/10/5/5,--mix 解析
+  // 后被静默忽略,负载与文档声明不一致)。
+  const uint64_t cf_p = args.mix_cf;
+  const uint64_t sd_p = args.mix_sd;
+  const uint64_t dist_p = args.mix_dist;
+  const uint64_t add_p = args.mix_add;
   while (run.load(std::memory_order_relaxed)) {
     uint64_t roll = rng() % 100;
     OpType op;
