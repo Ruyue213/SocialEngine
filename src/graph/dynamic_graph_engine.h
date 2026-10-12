@@ -84,7 +84,7 @@ class DynamicGraphEngine : public IGraphEngine {
   bool cache_available() const { return redis_ && redis_->enabled(); }
 
   void DedupCheck(const std::string& key, int ttl_seconds,
-                  std::function<void(bool)> cb);
+                  std::function<void(RedisClient::DedupStatus)> cb);
 
   bool Recover();
   // 原子检查点:同一 ckpt_mu_ 独占区间内完成「快照 + WAL 截断」,

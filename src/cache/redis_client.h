@@ -28,6 +28,11 @@ class RedisClient {
 
   using CallbackExecutor = std::function<void(std::function<void()>)>;
 
+  // 去重抢占三态。原实现 bool 把「Redis 故障/队列满」与「重复请求」
+  // 混为一谈:连接失败被当成 duplicate 返回成功,更新实际未执行,
+  // 调用方却收到 200。
+  enum class DedupStatus { kAcquired, kDuplicate, kError };
+
   RedisClient(const Config& cfg, CallbackExecutor schedule);
   ~RedisClient();
   RedisClient(const RedisClient&) = delete;
@@ -44,7 +49,7 @@ class RedisClient {
                       std::function<void()> cb = nullptr, int64_t argv1 = -1);
 
   void SetNxAsync(const std::string& key, int ttl_seconds,
-                  std::function<void(bool)> cb);
+                  std::function<void(DedupStatus)> cb);
 
   void SetAsync(const std::string& key, const std::string& value, std::function<void()> cb = nullptr);
 
@@ -70,7 +75,7 @@ class RedisClient {
     std::function<void(bool, const std::string&)> get_cb;
     std::function<void()> done_cb;
     std::function<void(int64_t)> incr_cb;
-    std::function<void(bool)> result_cb;
+    std::function<void(DedupStatus)> result_cb;
   };
 
   void IoLoop(size_t idx);

@@ -119,6 +119,15 @@ void GraphService::HandleQuery(net::HttpRequest&& req,
       return;
     }
   }
+  // 修复:入口校验节点域。原实现直接 static_cast<uint32_t> 截断,
+  // a=2^32+x 会变成 x 落到任意节点;截断结果超出节点容量时
+  // 引擎内 adj_[u] 数组越界(未定义行为)。
+  size_t nodes = engine_.node_count();
+  auto id_in_range = [&](uint64_t x) { return x >= 1 && x <= nodes; };
+  if (!id_in_range(a) || (type != "sd" && !id_in_range(b))) {
+    respond(400, "{\"error\":\"node id out of range\"}");
+    return;
+  }
   QueryType qt;
   if (type == "cf") {
     qt = QueryType::kCommonFriends;
@@ -177,6 +186,12 @@ void GraphService::HandleEdge(net::HttpRequest&& req,
     respond(400, "{\"error\":\"missing v\"}");
     return;
   }
+  // 同 HandleQuery:入口校验节点域,拒绝截断后越界的 ID。
+  size_t nodes = engine_.node_count();
+  if (u < 1 || u > nodes || v < 1 || v > nodes) {
+    respond(400, "{\"error\":\"node id out of range\"}");
+    return;
+  }
   std::string dedup_key = Json::ParseStr(req.body, "dedup_key", &ok);
   if (!ok || dedup_key.empty()) {
     bool done = op == "add" ? engine_.AddEdge(static_cast<uint32_t>(u),
@@ -191,9 +206,17 @@ void GraphService::HandleEdge(net::HttpRequest&& req,
     return;
   }
   engine_.DedupCheck(dedup_key, dedup_ttl_,
-                     [this, op, u, v, respond](bool acquired) {
-    if (!acquired) {
+                     [this, op, u, v, respond](dge::RedisClient::DedupStatus st) {
+    if (st == dge::RedisClient::DedupStatus::kDuplicate) {
       respond(200, "{\"ok\":true,\"dedup\":true}");
+      return;
+    }
+    if (st == dge::RedisClient::DedupStatus::kError) {
+      // 修复:去重依赖故障时显式 503,由客户端重试。
+      // 原实现把连接失败当 duplicate 返回 200,更新未执行
+      // 却告知成功。
+      metrics::Inc("http_responses_total", {{"status", "503"}});
+      respond(503, "{\"error\":\"dedup backend unavailable, safe to retry\"}");
       return;
     }
     bool done = op == "add" ? engine_.AddEdge(static_cast<uint32_t>(u),

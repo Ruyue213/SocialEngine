@@ -182,9 +182,16 @@ void RedisClient::HandleReply(Op& op, redisReply* r) {
       break;
     }
     case Op::Type::kEvalResult: {
-      bool acquired = r->type == REDIS_REPLY_STATUS || r->type == REDIS_REPLY_STRING;
+      // SET NX 语义三态:STATUS/STRING = 抢占成功;NIL = 已被占用
+      // (重复请求);其余(错误回复)= 故障。
+      DedupStatus st = DedupStatus::kError;
+      if (r->type == REDIS_REPLY_STATUS || r->type == REDIS_REPLY_STRING) {
+        st = DedupStatus::kAcquired;
+      } else if (r->type == REDIS_REPLY_NIL) {
+        st = DedupStatus::kDuplicate;
+      }
       if (op.result_cb) {
-        schedule_([cb = std::move(op.result_cb), acquired]() { cb(acquired); });
+        schedule_([cb = std::move(op.result_cb), st]() { cb(st); });
       }
       break;
     }
@@ -209,7 +216,7 @@ void RedisClient::DropOp(Op& op) {
       break;
     case Op::Type::kEvalResult:
       if (op.result_cb) {
-        schedule_([cb = std::move(op.result_cb)]() { cb(false); });
+        schedule_([cb = std::move(op.result_cb)]() { cb(DedupStatus::kError); });
       }
       break;
     case Op::Type::kGet:
@@ -381,33 +388,42 @@ void RedisClient::IoLoop(size_t idx) {
 }
 
 void RedisClient::EnqueueRead(size_t idx, Op op) {
+  // 修复:队列满时统一走 DropOp 按操作类型分派回调。原实现只
+  // 调 op.get_cb,SET NX 抢占(kEvalResult,result_cb)被静默
+  // 丢弃,请求悬挂无终态。
+  bool dropped = false;
   {
     std::lock_guard<std::mutex> lk(*io_mus_[idx]);
     if (io_queue_sizes_[idx] >= cfg_.io_queue_cap) {
-      dropped_writes_.fetch_add(1, std::memory_order_relaxed);
-      if (op.get_cb) {
-        schedule_([cb = std::move(op.get_cb)]() mutable { cb(false, ""); });
-      }
-      return;
+      dropped = true;
+    } else {
+      io_queues_[idx].push_front(std::move(op));
+      ++io_queue_sizes_[idx];
     }
-    io_queues_[idx].push_front(std::move(op));
-    ++io_queue_sizes_[idx];
+  }
+  if (dropped) {
+    dropped_writes_.fetch_add(1, std::memory_order_relaxed);
+    DropOp(op);
+    return;
   }
   io_cvs_[idx]->notify_one();
 }
 
 void RedisClient::EnqueueWrite(size_t idx, Op op) {
+  bool dropped = false;
   {
     std::lock_guard<std::mutex> lk(*io_mus_[idx]);
     if (io_queue_sizes_[idx] >= cfg_.io_queue_cap) {
-      dropped_writes_.fetch_add(1, std::memory_order_relaxed);
-      if (op.done_cb) {
-        schedule_(std::move(op.done_cb));
-      }
-      return;
+      dropped = true;
+    } else {
+      io_queues_[idx].push_back(std::move(op));
+      ++io_queue_sizes_[idx];
     }
-    io_queues_[idx].push_back(std::move(op));
-    ++io_queue_sizes_[idx];
+  }
+  if (dropped) {
+    dropped_writes_.fetch_add(1, std::memory_order_relaxed);
+    DropOp(op);
+    return;
   }
   io_cvs_[idx]->notify_one();
 }
@@ -468,10 +484,10 @@ void RedisClient::EvalWriteAsync(const std::vector<std::string>& keys,
 }
 
 void RedisClient::SetNxAsync(const std::string& key, int ttl_seconds,
-                            std::function<void(bool)> cb) {
+                             std::function<void(DedupStatus)> cb) {
   if (!enabled_.load(std::memory_order_relaxed) || stop_) {
     if (cb) {
-      schedule_([cb = std::move(cb)]() { cb(true); });
+      schedule_([cb = std::move(cb)]() { cb(DedupStatus::kError); });
     }
     return;
   }

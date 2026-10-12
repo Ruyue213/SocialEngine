@@ -146,9 +146,12 @@ DynamicGraphEngine::DynamicGraphEngine(const Config& cfg)
     rcfg.double_delete_delay_ms = cfg_.double_delete_delay_ms;
     redis_ = std::make_unique<RedisClient>(
         rcfg, [this](std::function<void()> fn) {
-          if (!shutdown_.load(std::memory_order_relaxed)) {
-            workers_.SubmitInternal(std::move(fn));
-          }
+          // 修复:停机后不再丢弃 Redis 完成任务。原实现 shutdown_ 置位
+          // 后完成回调被丢弃,已 Pin 的查询永远不 Unpin(生命周期泄漏),
+          // 且已接纳请求无法到达终态。排空顺序保证:Shutdown() 先
+          // redis_->Shutdown()(join IO 线程,全部完成回调已投递),
+          // 后 workers_.Shutdown()(join worker,处理完投递任务后退出)。
+          workers_.SubmitInternal(std::move(fn));
         });
   }
   if (!cfg_.wal_path.empty()) {
@@ -774,10 +777,11 @@ bool DynamicGraphEngine::ParseFriends(const std::string& s, std::vector<uint32_t
 }
 
 void DynamicGraphEngine::DedupCheck(const std::string& key, int ttl_seconds,
-                                  std::function<void(bool)> cb) {
+                                    std::function<void(RedisClient::DedupStatus)> cb) {
   if (!redis_ || !redis_->enabled()) {
+    // Redis 未启用:直通放行,由更新接口自身的幂等语义兜底。
     if (cb) {
-      cb(true);
+      cb(RedisClient::DedupStatus::kAcquired);
     }
     return;
   }

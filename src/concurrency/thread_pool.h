@@ -36,7 +36,7 @@ class ThreadPool {
   std::condition_variable cv_;
   std::atomic<uint64_t> approx_size_{0};
   size_t queue_cap_;
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};  // 提交路径锁外检查用
   std::vector<std::thread> threads_;
 };
 
