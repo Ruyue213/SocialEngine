@@ -2,3 +2,4 @@
 2026-10-12T22:50 uniform-300k-16c-25s qps=50860 mem_mb=197.2 (optimized, baseline 34455 => 1.48x)
 2026-10-12T22:52 zipf-hot-300k-16c-25s qps=2850 mem_mb=196.9 (optimized, baseline 3902 => 0.73x, 压缩解码取舍边界)
 2026-10-12T22:58 http-300k-16c-15s qps=20370 avg_us=371 p99_us=2048 (全链路 Multi-Reactor+线程池)
+2026-10-12T23:40 uniform-300k-16c-25s qps=56635 mem_mb=196.5 (Dekker双检协议+WAL-ahead后复测,与50860同波动区间,协议强化无回归)
