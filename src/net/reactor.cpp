@@ -101,6 +101,7 @@ void HttpServer::MainLoop() {
       Conn* raw = conn.get();
       {
         std::lock_guard<std::mutex> lk(sr->mu);
+        conn->gen = sr->next_gen++;
         sr->new_conns.emplace_back(cfd, raw);
       }
       sr->wake.Notify();
@@ -108,6 +109,16 @@ void HttpServer::MainLoop() {
     }
   }
   ::close(listen_fd_);
+}
+
+void HttpServer::CompactSentPrefix(Conn* c) {
+  // 修复:部分写(EAGAIN)后 out_off > 0 时,新响应不能直接
+  // out += resp 并把 out_off 归零——那会从已发送前缀开始重发,
+  // 对端收到字节流重复,HTTP 响应损坏。先把已发送前缀裁掉。
+  if (c->out_off > 0) {
+    c->out.erase(0, c->out_off);
+    c->out_off = 0;
+  }
 }
 
 void HttpServer::FlushResponses(SubReactor* sr, Conn* c) {
@@ -119,8 +130,8 @@ void HttpServer::FlushResponses(SubReactor* sr, Conn* c) {
     if (it->second.first == 503) {
       c->close_after = true;
     }
+    CompactSentPrefix(c);
     c->out += it->second.second;
-    c->out_off = 0;
     c->resp_map.erase(it);
     ++c->next_resp_seq;
   }
@@ -144,14 +155,17 @@ void HttpServer::SubLoop(SubReactor* sr) {
                       sr->pending_responses.size(), sr->conns.size());
         sr->wake.Drain();
         std::vector<std::pair<int, Conn*>> incoming;
-        std::vector<std::pair<int, std::pair<uint64_t, std::pair<int, std::string>>>> pend;
+        std::vector<PendingResp> pend;
         {
           std::lock_guard<std::mutex> lk(sr->mu);
           incoming.swap(sr->new_conns);
           for (auto& pr : sr->pending_responses) {
-            auto it = sr->conns.find(pr.first);
-            if (it != sr->conns.end()) {
-              it->second->resp_map[pr.second.first] = pr.second.second;
+            auto it = sr->conns.find(pr.fd);
+            // 修复:fd+代际双重校验。原实现只按 fd 查表,连接关闭后
+            // fd 被新连接复用时,迟到响应会投递到新连接,把 A 请求的
+            // 响应发给 B 连接。代际不匹配的响应直接丢弃。
+            if (it != sr->conns.end() && it->second->gen == pr.gen) {
+              it->second->resp_map[pr.req_seq] = {pr.status, std::move(pr.resp)};
             }
           }
           sr->pending_responses.clear();
@@ -250,13 +264,14 @@ bool HttpServer::HandleRead(SubReactor* sr, Conn* c) {
     c->in.erase(0, consumed);
     c->last_active_ms = NowMs();
     int conn_fd = c->fd;
+    uint64_t conn_gen = c->gen;
     uint64_t req_seq = c->next_req_seq++;
     handler_(std::move(req),
-             [this, sr, conn_fd, req_seq, keep_alive](int status, std::string body) {
+             [this, sr, conn_fd, conn_gen, req_seq, keep_alive](int status, std::string body) {
       std::string resp = BuildResponse(status, "application/json", body, keep_alive);
       if (sr->thread.get_id() == std::this_thread::get_id()) {
         auto it = sr->conns.find(conn_fd);
-        if (it != sr->conns.end()) {
+        if (it != sr->conns.end() && it->second->gen == conn_gen) {
           Conn* cc = it->second.get();
           cc->resp_map[req_seq] = {status, std::move(resp)};
           FlushResponses(sr, cc);
@@ -265,8 +280,8 @@ bool HttpServer::HandleRead(SubReactor* sr, Conn* c) {
       }
       {
         std::lock_guard<std::mutex> lk(sr->mu);
-        sr->pending_responses.emplace_back(
-            conn_fd, std::make_pair(req_seq, std::make_pair(status, std::move(resp))));
+        sr->pending_responses.push_back(
+            {conn_fd, conn_gen, req_seq, status, std::move(resp)});
       }
       sr->wake.Notify();
     });

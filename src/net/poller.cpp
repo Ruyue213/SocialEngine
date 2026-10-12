@@ -36,6 +36,7 @@ Poller::~Poller() {
 }
 
 void Poller::Add(int fd, uint32_t events, void* udata) {
+  (void)udata;
 #if defined(__linux__)
   struct epoll_event ev;
   std::memset(&ev, 0, sizeof(ev));
@@ -46,7 +47,11 @@ void Poller::Add(int fd, uint32_t events, void* udata) {
   if (events & kWrite) {
     ev.events |= EPOLLOUT;
   }
-  ev.data.ptr = udata;
+  // 修复:统一以 fd 作为事件载荷。原实现注册时写 epoll_data.ptr,
+  // 返回时却读同一 union 的 fd 成员——指针位模式被当成连接 fd,
+  // SubReactor 按错误值查连接表,事件无法关联到正确连接。
+  // 生命周期由连接表(fd → Conn)管理,与 kqueue 路径一致。
+  ev.data.fd = fd;
   ::epoll_ctl(fd_, EPOLL_CTL_ADD, fd, &ev);
 #elif defined(__APPLE__)
   struct kevent changes[2];
@@ -62,6 +67,7 @@ void Poller::Add(int fd, uint32_t events, void* udata) {
 }
 
 void Poller::Mod(int fd, uint32_t events, void* udata) {
+  (void)udata;
 #if defined(__linux__)
   struct epoll_event ev;
   std::memset(&ev, 0, sizeof(ev));
@@ -72,7 +78,7 @@ void Poller::Mod(int fd, uint32_t events, void* udata) {
   if (events & kWrite) {
     ev.events |= EPOLLOUT;
   }
-  ev.data.ptr = udata;
+  ev.data.fd = fd;
   ::epoll_ctl(fd_, EPOLL_CTL_MOD, fd, &ev);
 #elif defined(__APPLE__)
   struct kevent changes[2];
@@ -112,8 +118,9 @@ int Poller::Wait(std::vector<PollEvent>& out, int timeout_ms) {
   }
   out.resize(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
+    // 与注册端约定一致:读 data.fd(注册时写入的也是 fd)。
     out[i].fd = events[i].data.fd;
-    out[i].udata = events[i].data.ptr;
+    out[i].udata = nullptr;  // 连接上下文由上层经 fd 查表获得
     out[i].events = 0;
     if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
       out[i].events |= kRead;

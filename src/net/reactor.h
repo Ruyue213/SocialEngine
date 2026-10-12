@@ -33,6 +33,9 @@ class HttpServer {
  private:
   struct Conn {
     int fd;
+    // 连接代际:fd 会被操作系统复用,异步响应只凭 fd 投递会命中
+    // 复用该 fd 的新连接。代际校验贯穿响应回投路径。
+    uint64_t gen;
     std::string in;
     std::string out;
     size_t out_off = 0;
@@ -43,16 +46,24 @@ class HttpServer {
     std::map<uint64_t, std::pair<int, std::string>> resp_map;
   };
 
+  struct PendingResp {
+    int fd;
+    uint64_t gen;
+    uint64_t req_seq;
+    int status;
+    std::string resp;
+  };
+
   struct SubReactor {
     std::unique_ptr<Poller> poller;
     WakeFd wake;
     std::mutex mu;
     std::vector<std::pair<int, Conn*>> new_conns;
     std::unordered_map<int, std::unique_ptr<Conn>> conns;
-    std::vector<std::pair<int, std::pair<uint64_t, std::pair<int, std::string>>>>
-        pending_responses;
+    std::vector<PendingResp> pending_responses;
     std::thread thread;
     std::atomic<bool> stop{false};
+    uint64_t next_gen = 1;
   };
 
   void MainLoop();
@@ -62,6 +73,8 @@ class HttpServer {
   bool HandleWrite(SubReactor* sr, Conn* c);
   void CloseConn(SubReactor* sr, Conn* c);
   int64_t NowMs();
+  // 部分写后压缩已发送前缀,追加新响应前调用。
+  void CompactSentPrefix(Conn* c);
 
   int port_;
   int listen_fd_ = -1;

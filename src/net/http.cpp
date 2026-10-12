@@ -27,6 +27,41 @@ const char* StatusText(int status) {
   }
 }
 
+namespace {
+
+// RFC 9110:字段名大小写不敏感。原实现 find("Content-Length") 精确
+// 匹配,小写/混合大小写头被静默忽略,POST body 被截断或误读。
+std::string Lower(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  return s;
+}
+
+// 完整解析无符号十进制数:拒绝空串、非数字字符、正负号与溢出。
+// 原实现 strtoull 对非法输入静默返回 0,Content-Length: abc 被当作 0。
+bool ParseSizeT(const std::string& s, size_t& out) {
+  if (s.empty() || s.size() > 20) {
+    return false;
+  }
+  uint64_t v = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    v = v * 10 + static_cast<uint64_t>(c - '0');
+    if (v > (1ULL << 62)) {
+      return false;
+    }
+  }
+  out = static_cast<size_t>(v);
+  return true;
+}
+
+}  // namespace
+
 ParseResult ParseRequest(const char* data, size_t len, HttpRequest& out, size_t& consumed) {
   const char* line_end = static_cast<const char*>(std::memchr(data, '\n', len));
   if (line_end == nullptr) {
@@ -92,12 +127,32 @@ ParseResult ParseRequest(const char* data, size_t len, HttpRequest& out, size_t&
   }
 
   size_t content_length = 0;
-  auto it = out.headers.find("Content-Length");
-  if (it != out.headers.end()) {
-    content_length = static_cast<size_t>(std::strtoull(it->second.c_str(), nullptr, 10));
-    if (content_length > 1024 * 1024) {
-      return ParseResult::kError;
+  bool have_length = false;
+  bool have_te = false;
+  for (const auto& [name, value] : out.headers) {
+    std::string lname = Lower(name);
+    if (lname == "content-length") {
+      size_t v = 0;
+      if (!ParseSizeT(value, v)) {
+        return ParseResult::kError;
+      }
+      if (have_length && v != content_length) {
+        return ParseResult::kError;  // 重复且不一致,按 RFC 9110 拒绝
+      }
+      content_length = v;
+      have_length = true;
+    } else if (lname == "transfer-encoding") {
+      have_te = true;
     }
+  }
+  if (have_te && have_length) {
+    return ParseResult::kError;  // 两头并存,拒绝
+  }
+  if (have_te) {
+    return ParseResult::kError;  // 仅支持固定长度 body
+  }
+  if (content_length > 1024 * 1024) {
+    return ParseResult::kError;
   }
   if (len - pos < content_length) {
     return ParseResult::kNeedMore;
