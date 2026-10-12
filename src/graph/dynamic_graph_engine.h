@@ -87,7 +87,9 @@ class DynamicGraphEngine : public IGraphEngine {
                   std::function<void(bool)> cb);
 
   bool Recover();
-  bool WriteSnapshot();
+  // 原子检查点:同一 ckpt_mu_ 独占区间内完成「快照 + WAL 截断」,
+  // 消除快照完成后、截断前进来的更新被误删的窗口。
+  bool Checkpoint();
   void RotateWal() {
     if (wal_) {
       wal_->Rotate();
@@ -134,6 +136,7 @@ class DynamicGraphEngine : public IGraphEngine {
 
   void InvalidateCache(uint32_t u, uint32_t v);
   void DoubleDelete(const std::vector<std::string>& keys);
+  bool WriteSnapshotLocked();
 
   std::string DistKey(uint32_t u, uint32_t v) const;
   std::string CfKey(uint32_t u, uint32_t v) const;
@@ -158,6 +161,11 @@ class DynamicGraphEngine : public IGraphEngine {
   bool maint_stop_ = false;
   std::thread maint_thread_;
   std::vector<uint32_t> maint_scratch_;
+  // 检查点屏障:checkpoint 持独占(期间图静止,快照 LSN 与图状态
+  // 严格对应);AddEdge/RemoveEdge/CompactNode/Recover 持共享。
+  // 消除「先读 last_seq 再扫描,期间更新追加 WAL,checkpoint 后
+  // Rotate 截断丢失这些记录」的窗口。
+  std::shared_mutex ckpt_mu_;
 
   std::atomic<uint64_t> shed_count_{0};
   std::atomic<uint64_t> queries_submitted_{0};

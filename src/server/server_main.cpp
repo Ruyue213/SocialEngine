@@ -4,6 +4,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unistd.h>
 
 #include "common/affinity.h"
 #include "common/graph_gen.h"
@@ -134,22 +135,30 @@ int main(int argc, char** argv) {
   dge::DynamicGraphEngine engine(cfg);
   engine.SetCacheInvalidation(false);
   engine.SetWalEnabled(false);
-  if (!wal_path.empty()) {
-    engine.Recover();
+  // 修复:以持久化文件存在性区分「恢复启动」与「全新启动」。
+  // 原实现无条件 BA 建图:恢复出的图被随机图覆盖,历史上删除的
+  // 边被重新加回,且随后的快照+截断把被污染的状态固化为新基线。
+  bool has_wal = !wal_path.empty() && ::access(wal_path.c_str(), F_OK) == 0;
+  bool has_snapshot = !snapshot_path.empty() && ::access(snapshot_path.c_str(), F_OK) == 0;
+  if (has_wal || has_snapshot) {
+    if (!engine.Recover()) {
+      DGE_LOG_ERROR("recovery failed, refusing to overwrite persisted history; exiting");
+      return 2;
+    }
     DGE_LOG_INFO("wal recovery done, graph has %llu updates",
                  static_cast<unsigned long long>(engine.stats().updates));
+  } else {
+    DGE_LOG_INFO("building graph: %zu nodes, degree %u", nodes, degree);
+    std::vector<std::pair<uint32_t, uint32_t>> edges;
+    dge::GenerateBarabasiAlbert(engine, nodes, degree, seed, edges);
+    DGE_LOG_INFO("graph ready: %zu edges, memory %.1fMB", edges.size(),
+                 engine.stats().memory_bytes / 1024.0 / 1024.0);
   }
-  DGE_LOG_INFO("building graph: %zu nodes, degree %u", nodes, degree);
-  std::vector<std::pair<uint32_t, uint32_t>> edges;
-  dge::GenerateBarabasiAlbert(engine, nodes, degree, seed, edges);
-  DGE_LOG_INFO("graph ready: %zu edges, memory %.1fMB", edges.size(),
-               engine.stats().memory_bytes / 1024.0 / 1024.0);
   engine.SetCacheInvalidation(true);
   if (!wal_path.empty()) {
-    engine.WriteSnapshot();
-    engine.RotateWal();
+    engine.Checkpoint();
     engine.SetWalEnabled(true);
-    DGE_LOG_INFO("bulk load snapshot done, wal enabled");
+    DGE_LOG_INFO("baseline snapshot done, wal enabled");
   }
 
   dge::GraphService service(engine, dedup_ttl);

@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "common/affinity.h"
+#include "common/logging.h"
 #include "graph/intersect.h"
 
 namespace dge {
@@ -154,9 +155,9 @@ DynamicGraphEngine::DynamicGraphEngine(const Config& cfg)
     wal_ = std::make_unique<WalWriter>(
         cfg_.wal_path, cfg_.wal_sync_mode, cfg_.wal_checkpoint_bytes,
         [this]() {
-          if (WriteSnapshot()) {
-            wal_->Rotate();
-          }
+          // 检查点回调(由 WAL 后台线程在锁外触发):整个快照+截断
+          // 在 ckpt_mu_ 独占区间内原子完成。
+          Checkpoint();
         });
   }
   maint_thread_ = std::thread([this]() { MaintenanceLoop(); });
@@ -519,23 +520,42 @@ bool DynamicGraphEngine::AddEdge(uint32_t u, uint32_t v) {
     std::swap(b1, b2);
     std::swap(u, v);
   }
+  std::shared_lock<std::shared_mutex> ckpt(ckpt_mu_);
   std::unique_lock<std::shared_mutex> lk1(buckets_[b1].mu);
   std::unique_lock<std::shared_mutex> lk2(buckets_[b2].mu, std::defer_lock);
   if (b2 != b1) {
     lk2.lock();
   }
+  // 完整删除语义:尾满重建会把刚插入的边固化进压缩块,撤销不能
+  // 只清尾部(原实现缺陷:第二端点失败时第一端点的边可能残留在
+  // 压缩块中,破坏双端对称不变量)。
+  auto rollback_edge = [&](uint32_t x, uint32_t y) {
+    bool f = storage::tail_remove(pool_, adj_[x], y);
+    if (!f) {
+      storage::block_remove(pool_, adj_[x], y, f);
+    }
+  };
   if (!PrepareAddToNode(u, v)) {
     return false;
   }
   if (!PrepareAddToNode(v, u)) {
-    storage::tail_remove(pool_, adj_[u], v);
+    rollback_edge(u, v);
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_updates_total");
   if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
       !recovering_.load(std::memory_order_relaxed)) {
-    wal_->Append(0x01, u, v);
+    // 修复:传播 Append 失败。原先忽略返回值,刷盘错误被吞掉,
+    // 调用方收到成功但更新不可恢复。失败时回滚内存侧,保证
+    // 「返回 true ⟺ 更新已进入 WAL」(组提交档为已入缓冲)。
+    if (!wal_->Append(0x01, u, v)) {
+      rollback_edge(u, v);
+      rollback_edge(v, u);
+      updates_.fetch_sub(1, std::memory_order_relaxed);
+      DGE_LOG_ERROR("wal append failed, add(%u,%u) rolled back", u, v);
+      return false;
+    }
   }
 #ifdef DGE_VERIFY
   {
@@ -566,6 +586,7 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
     std::swap(b1, b2);
     std::swap(u, v);
   }
+  std::shared_lock<std::shared_mutex> ckpt(ckpt_mu_);
   std::unique_lock<std::shared_mutex> lk1(buckets_[b1].mu);
   std::unique_lock<std::shared_mutex> lk2(buckets_[b2].mu, std::defer_lock);
   if (b2 != b1) {
@@ -588,7 +609,19 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
   metrics::Inc("engine_updates_total");
   if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
       !recovering_.load(std::memory_order_relaxed)) {
-    wal_->Append(0x02, u, v);
+    // 修复:Append 失败时把边加回,保证内存状态与「未确认持久化」
+    // 一致,调用方语义与 AddEdge 对称。回滚走完整 PrepareAddToNode
+    // (含尾满重建),忽略返回值并记日志——Append 失败属于极端故障
+    // 路径,回滚后即使尾满也会在下一轮整理收敛。
+    if (!wal_->Append(0x02, u, v)) {
+      if (!PrepareAddToNode(u, v) || !PrepareAddToNode(v, u)) {
+        DGE_LOG_ERROR("wal append failed and rollback incomplete for remove(%u,%u)", u, v);
+      } else {
+        DGE_LOG_ERROR("wal append failed, remove(%u,%u) rolled back", u, v);
+      }
+      updates_.fetch_sub(1, std::memory_order_relaxed);
+      return false;
+    }
   }
   if (storage::node_needs_compaction(adj_[u], cfg_.hole_ratio_threshold)) {
     MarkDirty(u);
@@ -612,6 +645,7 @@ void DynamicGraphEngine::MarkDirty(uint32_t node) {
 
 void DynamicGraphEngine::CompactNode(uint32_t node) {
   Bucket& b = buckets_[BucketOf(node)];
+  std::shared_lock<std::shared_mutex> ckpt(ckpt_mu_);
   std::unique_lock<std::shared_mutex> lk(b.mu);
   if (dirty_flags_[node].load(std::memory_order_relaxed) == 0) {
     return;
@@ -750,10 +784,12 @@ void DynamicGraphEngine::DedupCheck(const std::string& key, int ttl_seconds,
   redis_->SetNxAsync(key, ttl_seconds, std::move(cb));
 }
 
-bool DynamicGraphEngine::WriteSnapshot() {
+bool DynamicGraphEngine::WriteSnapshotLocked() {
   if (cfg_.snapshot_path.empty() || !wal_) {
     return false;
   }
+  // 调用方持有 ckpt_mu_ 独占:无更新、无整理、无恢复,图静止,
+  // 读取的 last_seq 与图状态严格对应。
   uint64_t lsn = wal_->last_seq();
   bool ok = WriteSnapshotFile(
       cfg_.snapshot_path, lsn, [this](const std::function<void(uint64_t, uint64_t)>& emit) {
@@ -773,11 +809,29 @@ bool DynamicGraphEngine::WriteSnapshot() {
   return ok;
 }
 
+bool DynamicGraphEngine::Checkpoint() {
+  if (cfg_.snapshot_path.empty() || !wal_) {
+    return false;
+  }
+  std::unique_lock<std::shared_mutex> ckpt(ckpt_mu_);
+  if (!WriteSnapshotLocked()) {
+    return false;
+  }
+  wal_->Rotate();
+  return true;
+}
+
 bool DynamicGraphEngine::Recover() {
   if (cfg_.wal_path.empty()) {
     return true;
   }
   recovering_.store(true, std::memory_order_relaxed);
+  // 不持 ckpt_mu_:恢复路径的 AddEdge/RemoveEdge 会取 ckpt_mu_ 共享,
+  // std::shared_mutex 不可重入,外层持独占会自锁。恢复期间安全性由
+  // 两个事实保证:(1) recovering_ 为真时更新不 Append,WAL 后台
+  // 线程的 bytes_ 从 0 起不可能越过 checkpoint 阈值,checkpoint
+  // 不会与恢复并发;(2) 恢复与后台整理都被各桶锁互斥。
+  uint64_t last_seq = 0;
   bool ok = RecoverFromWal(cfg_.wal_path, cfg_.snapshot_path,
                            [this](uint8_t op, uint64_t u, uint64_t v) {
                              if (op == 0x01) {
@@ -785,7 +839,14 @@ bool DynamicGraphEngine::Recover() {
                              } else {
                                RemoveEdge(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
                              }
-                           });
+                           },
+                           &last_seq);
+  // 修复:把已恢复序号回传 writer。原实现 last_seq 从 0 重新计数,
+  // 重启后新记录与历史记录序号冲突,下次恢复按 seq > snapshot_lsn
+  // 过滤时新记录被静默跳过(已用快照 LSN=1 + 新增 seq=1 反例复现)。
+  if (wal_) {
+    wal_->AdvanceSeq(last_seq);
+  }
   recovering_.store(false, std::memory_order_relaxed);
   metrics::Inc("engine_recoveries_total");
   return ok;

@@ -382,17 +382,18 @@ void TestWalSyncRecovery() {
   std::string wal_path = std::string(dir) + "/wal.log";
   std::string snap_path = std::string(dir) + "/snap.bin";
 
-  auto make_engine = [&](bool with_wal) {
+  auto make_engine = [&](bool) {
     dge::DynamicGraphEngine::Config cfg;
     cfg.nodes = 500;
     cfg.buckets = 8;
     cfg.pool_threads = 2;
     cfg.cache_enabled = false;
-    if (with_wal) {
-      cfg.wal_path = wal_path;
-      cfg.wal_sync_mode = true;
-      cfg.snapshot_path = snap_path;
-    }
+    // 修复夹具:恢复引擎必须配置 WAL/快照路径,否则 Recover 在
+    // wal_path 为空时提前返回,测试实际在空图上与基线比较,
+    // 依赖稀疏图距离多为 -1 的巧合通过,掩盖真实回归。
+    cfg.wal_path = wal_path;
+    cfg.wal_sync_mode = true;
+    cfg.snapshot_path = snap_path;
     return std::make_unique<dge::DynamicGraphEngine>(cfg);
   };
   dge::BaselineGraphEngine::Config bc;
@@ -484,8 +485,7 @@ void TestWalSnapshotRecovery() {
     eng->AddEdge(u, v);
     base.AddEdge(u, v);
   }
-  CHECK(eng->WriteSnapshot());
-  eng->RotateWal();
+  CHECK(eng->Checkpoint());
   for (int i = 0; i < 100; ++i) {
     uint32_t u = 1 + rng() % 500;
     uint32_t v = 1 + rng() % 500;

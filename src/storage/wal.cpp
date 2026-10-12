@@ -91,7 +91,9 @@ bool WalWriter::Append(uint8_t op, uint64_t u, uint64_t v) {
   AppendU64(rec, seq);
   AppendU64(rec, u);
   AppendU64(rec, v);
-  uint32_t crc = Crc32(reinterpret_cast<const uint8_t*>(rec.data() + 5), 24);
+  // CRC 覆盖范围含操作码(偏移 4 起):原先从偏移 5 起计算,add/del
+  // 单字节篡改(偏移 4)不会改变校验值,损坏记录会被当作合法操作回放。
+  uint32_t crc = Crc32(reinterpret_cast<const uint8_t*>(rec.data() + 4), 25);
   AppendU32(rec, crc);
 
   if (sync_mode_) {
@@ -117,6 +119,13 @@ bool WalWriter::Append(uint8_t op, uint64_t u, uint64_t v) {
   return true;
 }
 
+void WalWriter::AdvanceSeq(uint64_t seq) {
+  uint64_t cur = last_seq_.load(std::memory_order_relaxed);
+  while (cur < seq &&
+         !last_seq_.compare_exchange_weak(cur, seq, std::memory_order_acq_rel)) {
+  }
+}
+
 void WalWriter::FlushLocked() {
   if (buffer_.empty()) {
     return;
@@ -136,19 +145,24 @@ void WalWriter::FlushLocked() {
 }
 
 void WalWriter::BackgroundLoop() {
-  auto last_fsync = std::chrono::steady_clock::now();
   while (!stop_.load(std::memory_order_relaxed)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    // 修复:检查点请求在锁内只置标志,回调移到锁外执行。
+    // 原实现持 mu_ 调用 on_checkpoint_,回调进入 WriteSnapshot →
+    // Rotate 再次获取同一把非递归 mu_,构成必现死锁;同时回调
+    // 持有 mu_ 期间逐桶取共享锁,与更新路径「桶锁 → WAL 锁」形成
+    // 反向依赖(AB-BA)。锁外执行后依赖方向单一,两类死锁同时消除。
+    bool request_ckpt = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (bytes_.load(std::memory_order_relaxed) > checkpoint_bytes_ && on_checkpoint_) {
-        on_checkpoint_();
+        request_ckpt = true;
       }
       FlushLocked();
     }
-    auto now = std::chrono::steady_clock::now();
-    (void)now;
-    (void)last_fsync;
+    if (request_ckpt) {
+      on_checkpoint_();
+    }
   }
   std::lock_guard<std::mutex> lk(mu_);
   FlushLocked();
@@ -178,7 +192,8 @@ void WalWriter::Shutdown() {
 }
 
 bool RecoverFromWal(const std::string& wal_path, const std::string& snapshot_path,
-                    std::function<void(uint8_t op, uint64_t u, uint64_t v)> apply) {
+                    std::function<void(uint8_t op, uint64_t u, uint64_t v)> apply,
+                    uint64_t* out_last_seq) {
   uint64_t snapshot_lsn = 0;
   {
     std::ifstream sf(snapshot_path, std::ios::binary);
@@ -209,13 +224,22 @@ bool RecoverFromWal(const std::string& wal_path, const std::string& snapshot_pat
       }
     }
   }
+  uint64_t max_seq = snapshot_lsn;
 
   std::ifstream wf(wal_path, std::ios::binary);
   if (!wf.good()) {
     DGE_LOG_INFO("no wal file, recovered from snapshot only");
+    if (out_last_seq != nullptr) {
+      *out_last_seq = max_seq;
+    }
     return true;
   }
   uint64_t replayed = 0;
+  // good_offset 跟踪最后一条完整通过校验的记录边界;恢复结束后将
+  // 文件截断到该边界,否则 O_APPEND 追加的新记录排在坏尾之后,
+  // 下次恢复在坏尾处停止回放,新记录永久不可达。
+  std::streamoff good_offset = 0;
+  bool tail_bad = false;
   while (wf.good()) {
     uint8_t rec[33];
     wf.read(reinterpret_cast<char*>(rec), 33);
@@ -225,18 +249,21 @@ bool RecoverFromWal(const std::string& wal_path, const std::string& snapshot_pat
     }
     if (got < 33) {
       DGE_LOG_WARN("wal tail truncated (%zd bytes), stop replay", got);
+      tail_bad = true;
       break;
     }
     uint32_t magic = 0;
     ReadU32(rec, magic);
     if (magic != kWalMagic) {
       DGE_LOG_WARN("wal magic mismatch, stop replay");
+      tail_bad = true;
       break;
     }
     uint32_t crc = 0;
     ReadU32(rec + 29, crc);
-    if (Crc32(rec + 5, 24) != crc) {
+    if (Crc32(rec + 4, 25) != crc) {
       DGE_LOG_WARN("wal crc mismatch, stop replay (torn write)");
+      tail_bad = true;
       break;
     }
     uint64_t seq = 0, u = 0, v = 0;
@@ -247,8 +274,25 @@ bool RecoverFromWal(const std::string& wal_path, const std::string& snapshot_pat
       apply(rec[4], u, v);
       ++replayed;
     }
+    if (seq > max_seq) {
+      max_seq = seq;
+    }
+    good_offset += 33;
   }
-  DGE_LOG_INFO("wal replay done: %llu records", static_cast<unsigned long long>(replayed));
+  if (tail_bad) {
+    if (::truncate(wal_path.c_str(), good_offset) != 0) {
+      DGE_LOG_ERROR("wal tail truncate failed: %s", std::strerror(errno));
+    } else {
+      DGE_LOG_INFO("wal truncated to last valid record (%lld bytes)",
+                   static_cast<long long>(good_offset));
+    }
+  }
+  DGE_LOG_INFO("wal replay done: %llu records, last_seq=%llu",
+               static_cast<unsigned long long>(replayed),
+               static_cast<unsigned long long>(max_seq));
+  if (out_last_seq != nullptr) {
+    *out_last_seq = max_seq;
+  }
   return true;
 }
 
