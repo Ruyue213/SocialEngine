@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -15,6 +16,9 @@
 #include "graph/dynamic_graph_engine.h"
 #include "graph/engine_interface.h"
 #include "graph/intersect.h"
+#include "cache/redis_client.h"
+#include "memory/epoch.h"
+#include "common/metrics.h"
 #include "memory/slab_pool.h"
 #include "storage/adjacency_store.h"
 #include "storage/wal.h"
@@ -570,6 +574,387 @@ void TestWalTornWrite() {
   base.Shutdown();
 }
 
+
+// ===================== 修复回归测试(2026-10 审查闭环) =====================
+
+void TestEpochReclaimSafety() {
+  printf("[test] EBR: pinned object survives sweep, freed after unpin\n");
+  auto* r = &dge::EpochReclaimer::Instance();
+  r->Sweep();
+  r->Sweep();
+  CHECK(r->retired_pending() == 0);
+  uint64_t before = r->freed_total();
+  uint32_t ticket = r->Pin();
+  void* p = std::malloc(64);
+  r->Retire(p, 64, nullptr);
+  // 读者持有 ticket 期间 Sweep:对象不得被回收。
+  r->Sweep();
+  CHECK(r->freed_total() == before);
+  CHECK(r->retired_pending() == 1);
+  r->Unpin(ticket);
+  r->Sweep();
+  CHECK(r->freed_total() == before + 1);
+  CHECK(r->retired_pending() == 0);
+}
+
+void TestDuplicateEdgeAfterCompression() {
+  printf("[test] duplicate edge rejected after compression rebuild\n");
+  auto e = MakeEngines(50);
+  // 30 条边触发尾满重建,邻居进入压缩块(尾容量 8)。
+  for (uint32_t v = 2; v <= 31; ++v) {
+    CHECK(e.opt->AddEdge(1, v));
+  }
+  // 30 条边已触发尾满重建,邻居进入压缩块;先确认边可达。
+  auto d = SyncQuery(*e.opt, dge::QueryType::kDistance, 1, 10);
+  CHECK(d.distance == 1);
+  // 压缩块中的边重复 Add 必须被拒绝(原实现只查尾部,重复插入
+  // 破坏差值编码严格递增前提)。
+  CHECK(!e.opt->AddEdge(1, 10));
+  CHECK(!e.opt->AddEdge(10, 1));
+  // 重复 Add 两次 + Remove 一次后必须不可达(原实现残留重复,
+  // 删一次仍然直连)。
+  e.opt->AddEdge(1, 10);
+  CHECK(e.opt->RemoveEdge(1, 10));
+  auto d2 = SyncQuery(*e.opt, dge::QueryType::kDistance, 1, 10);
+  CHECK(d2.distance == -1);
+  // 双端对称:10 的邻接不再含 1。
+  auto sd = SyncQuery(*e.opt, dge::QueryType::kSecondDegree, 10);
+  bool one_in_sd = false;
+  for (uint32_t f : sd.friends) {
+    if (f == 1) {
+      one_in_sd = true;
+    }
+  }
+  CHECK(!one_in_sd);
+  e.opt->Shutdown();
+  e.base->Shutdown();
+}
+
+void TestBfsBudget() {
+  printf("[test] bfs depth budget: consistent cap semantics\n");
+  auto mk = [](uint32_t cap) {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 20;
+    cfg.buckets = 4;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    cfg.max_bfs_depth = cap;
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  // 反例回归:cap=1,链 1-2-3 返回 -1;加支路 1-4 后(路径 1-4-3
+  // 长度 2)仍必须是 -1。原实现加支路后返回 2,超出预算且与
+  // 无支路场景矛盾。
+  {
+    auto eng = mk(1);
+    eng->AddEdge(1, 2);
+    eng->AddEdge(2, 3);
+    CHECK(SyncQuery(*eng, dge::QueryType::kDistance, 1, 3).distance == -1);
+    eng->AddEdge(1, 4);
+    eng->AddEdge(4, 3);
+    CHECK(SyncQuery(*eng, dge::QueryType::kDistance, 1, 3).distance == -1);
+    CHECK(SyncQuery(*eng, dge::QueryType::kDistance, 1, 4).distance == 1);
+    eng->Shutdown();
+  }
+  {
+    auto eng = mk(2);
+    eng->AddEdge(1, 2);
+    eng->AddEdge(2, 3);
+    CHECK(SyncQuery(*eng, dge::QueryType::kDistance, 1, 3).distance == 2);
+    CHECK(SyncQuery(*eng, dge::QueryType::kDistance, 1, 2).distance == 1);
+    eng->Shutdown();
+  }
+}
+
+void TestWalSeqContinuity() {
+  printf("[test] wal seq continuity across restarts\n");
+  const char* dir = "/tmp/dge_wal_seq";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  std::string snap_path = std::string(dir) + "/snap.bin";
+  auto mk = [&]() {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 100;
+    cfg.buckets = 8;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    cfg.wal_path = wal_path;
+    cfg.wal_sync_mode = true;
+    cfg.snapshot_path = snap_path;
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  // 阶段 A:写 3 条边,checkpoint(快照 lsn=3,WAL 清空)。
+  auto a = mk();
+  a->AddEdge(1, 11);
+  a->AddEdge(2, 12);
+  a->AddEdge(3, 13);
+  a->Checkpoint();
+  a->Shutdown();
+  // 阶段 B:恢复后写 2 条新边。原实现 seq 从 1 重新计数,
+  // 与快照 lsn=3 冲突,阶段 C 回放时按 seq > 3 过滤全部跳过。
+  auto b = mk();
+  CHECK(b->Recover());
+  CHECK(b->AddEdge(4, 14));
+  CHECK(b->AddEdge(5, 15));
+  b->Shutdown();
+  // 阶段 C:全部 5 条边必须可见。
+  auto c = mk();
+  CHECK(c->Recover());
+  CHECK(SyncQuery(*c, dge::QueryType::kDistance, 1, 11).distance == 1);
+  CHECK(SyncQuery(*c, dge::QueryType::kDistance, 2, 12).distance == 1);
+  CHECK(SyncQuery(*c, dge::QueryType::kDistance, 3, 13).distance == 1);
+  CHECK(SyncQuery(*c, dge::QueryType::kDistance, 4, 14).distance == 1);
+  CHECK(SyncQuery(*c, dge::QueryType::kDistance, 5, 15).distance == 1);
+  c->Shutdown();
+}
+
+void TestWalOpCodeTamper() {
+  printf("[test] wal crc rejects opcode tamper\n");
+  const char* dir = "/tmp/dge_wal_tamper";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  {
+    dge::WalWriter w(wal_path, true, 1ULL << 30, nullptr);
+    CHECK(w.Append(0x01, 7, 8));  // add
+  }
+  // 篡改偏移 4 的操作码 add -> del。原 CRC 从偏移 5 起计算,
+  // 此篡改不改变校验值,损坏记录被当作合法 del 回放。
+  {
+    FILE* f = fopen(wal_path.c_str(), "r+b");
+    CHECK(f != nullptr);
+    fseek(f, 4, SEEK_SET);
+    fputc(0x02, f);
+    fclose(f);
+  }
+  int applied = 0;
+  bool ok = dge::RecoverFromWal(wal_path, "", [&](uint8_t, uint64_t, uint64_t) { ++applied; });
+  CHECK(ok);
+  CHECK(applied == 0);
+}
+
+void TestWalBadTailTruncate() {
+  printf("[test] wal bad tail truncated, later appends replayable\n");
+  const char* dir = "/tmp/dge_wal_tail";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  {
+    dge::WalWriter w(wal_path, true, 1ULL << 30, nullptr);
+    CHECK(w.Append(0x01, 1, 2));
+    CHECK(w.Append(0x01, 3, 4));
+  }
+  {
+    FILE* f = fopen(wal_path.c_str(), "ab");
+    fputs("GARBAGE!", f);
+    fclose(f);
+  }
+  int applied = 0;
+  uint64_t last_seq = 0;
+  CHECK(dge::RecoverFromWal(wal_path, "", [&](uint8_t, uint64_t, uint64_t) { ++applied; },
+                            &last_seq));
+  CHECK(applied == 2);
+  CHECK(last_seq == 2);
+  // 坏尾被截断后追加的新记录,下次恢复必须可达(原实现 O_APPEND
+  // 排在坏尾之后,回放永远停在坏尾)。
+  {
+    dge::WalWriter w(wal_path, true, 1ULL << 30, nullptr);
+    w.AdvanceSeq(last_seq);
+    CHECK(w.Append(0x01, 5, 6));
+  }
+  int applied2 = 0;
+  CHECK(dge::RecoverFromWal(wal_path, "", [&](uint8_t, uint64_t, uint64_t) { ++applied2; }));
+  CHECK(applied2 == 3);
+}
+
+void TestWalCheckpointConcurrent() {
+  printf("[test] wal checkpoint concurrent with updates (no deadlock, no loss)\n");
+  const char* dir = "/tmp/dge_wal_ckpt";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  std::string snap_path = std::string(dir) + "/snap.bin";
+  dge::DynamicGraphEngine::Config cfg;
+  cfg.nodes = 200;
+  cfg.buckets = 8;
+  cfg.pool_threads = 2;
+  cfg.cache_enabled = false;
+  cfg.wal_path = wal_path;
+  cfg.wal_sync_mode = false;  // 后台线程驱动 checkpoint
+  cfg.snapshot_path = snap_path;
+  cfg.wal_checkpoint_bytes = 512;  // 极小阈值,高频触发
+  dge::DynamicGraphEngine eng(cfg);
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 3; ++t) {
+    threads.emplace_back([&, t]() {
+      std::mt19937_64 rng(9000 + t);
+      for (int i = 0; i < 400 && !stop.load(); ++i) {
+        uint32_t u = 1 + rng() % 200;
+        uint32_t v = 1 + rng() % 200;
+        if (u == v) {
+          continue;
+        }
+        if (i % 2 == 0) {
+          eng.AddEdge(u, v);
+        } else {
+          eng.RemoveEdge(u, v);
+        }
+      }
+    });
+  }
+  for (auto& th : threads) {
+    if (th.joinable()) {
+      th.join();  // 原实现在此死锁:checkpoint 持锁回调 + AB-BA
+    }
+  }
+  // 并发交错下动作序列不可重放,改为「一致切点采样对比」:
+  // Checkpoint() 持 ckpt_mu_ 独占,快照代表此刻图状态;采样一组
+  // 点对距离,恢复引擎上重放同样采样必须逐点一致。
+  CHECK(eng.Checkpoint());
+  std::vector<std::array<uint32_t, 3>> samples;
+  {
+    std::mt19937_64 rng(4242);
+    for (int i = 0; i < 60; ++i) {
+      uint32_t u = 1 + rng() % 200;
+      uint32_t v = 1 + rng() % 200;
+      if (u == v) {
+        continue;
+      }
+      auto r = SyncQuery(eng, dge::QueryType::kDistance, u, v);
+      samples.push_back({u, v, static_cast<uint32_t>(r.distance + 2)});
+    }
+  }
+  eng.Shutdown();
+  auto rec = std::make_unique<dge::DynamicGraphEngine>(cfg);
+  CHECK(rec->Recover());
+  for (auto& smp : samples) {
+    auto r = SyncQuery(*rec, dge::QueryType::kDistance, smp[0], smp[1]);
+    // distance 以 +2 偏移存储(区分 -1),还原比较。
+    if (r.distance != static_cast<int32_t>(smp[2]) - 2) {
+      printf("  checkpoint loss: %u-%u expect %d got %d\n", smp[0], smp[1],
+             static_cast<int32_t>(smp[2]) - 2, r.distance);
+      CHECK(false);
+      break;
+    }
+  }
+  rec->Shutdown();
+}
+
+void TestTimerEarlyTask() {
+  printf("[test] timer: earlier task inserted during wait fires on time\n");
+  dge::TimerHeap timer;
+  auto t0 = std::chrono::steady_clock::now();
+  std::atomic<int> late_done{0};
+  std::atomic<int> early_done{0};
+  std::chrono::steady_clock::time_point early_at{};
+  timer.Add(300, [&]() { ++late_done; });
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  timer.Add(15, [&]() {
+    early_at = std::chrono::steady_clock::now();
+    ++early_done;
+  });
+  // 原实现等待谓词只查 stop:早任务被唤醒后继续睡到 300ms 截止,
+  // 实测约 336ms 才执行。阈值 200ms 区分修复前后。
+  for (int i = 0; i < 100 && early_done.load() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  int early_delay_ms = static_cast<int>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(early_at - t0).count());
+  CHECK(early_done.load() == 1);
+  CHECK(early_delay_ms < 200);
+  (void)late_done;
+}
+
+void TestHistogramBuckets() {
+  printf("[test] histogram bucket boundaries (observe 3 -> le=4)\n");
+  const std::string name = "test_hist_bucket_xyz";
+  dge::metrics::Observe(name, 3);
+  dge::metrics::Observe(name, 4);
+  dge::metrics::Observe(name, 1);
+  std::string text = dge::metrics::Registry::Instance().PrometheusText();
+  bool has_le4 = false;
+  bool le2_zero = false;
+  size_t pos = 0;
+  const std::string prefix = name + "_bucket{le=\"";
+  while ((pos = text.find(prefix, pos)) != std::string::npos) {
+    size_t vstart = pos + prefix.size();
+    size_t vend = text.find("\"}", vstart);
+    std::string le = text.substr(vstart, vend - vstart);
+    size_t space = text.find(' ', vend);
+    uint64_t cnt = strtoull(text.substr(space + 1).c_str(), nullptr, 10);
+    if (le == "4") {
+      has_le4 = cnt >= 2;  // 3 和 4 都落 (2,4]
+    }
+    if (le == "2") {
+      // 桶 (·,2] 只含样本 1;旧实现把 3 也计入(边界错误)则为 3。
+      le2_zero = cnt == 1;
+    }
+    pos = vend;
+  }
+  CHECK(has_le4);
+  CHECK(le2_zero);
+}
+
+void TestThreadPoolAtomicCap() {
+  printf("[test] thread pool: concurrent submits respect queue cap\n");
+  constexpr size_t kCap = 4;
+  dge::ThreadPool pool(1, kCap, false, 0);
+  std::atomic<size_t> max_seen{0};
+  std::atomic<int> succeeded{0};
+  std::vector<std::thread> submitters;
+  for (int t = 0; t < 4; ++t) {
+    submitters.emplace_back([&]() {
+      for (int i = 0; i < 30; ++i) {
+        if (pool.Submit([&]() {
+              size_t cur = pool.queue_size();
+              size_t prev = max_seen.load();
+              while (cur > prev && !max_seen.compare_exchange_weak(prev, cur)) {
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            })) {
+          ++succeeded;
+        }
+      }
+    });
+  }
+  for (auto& th : submitters) {
+    th.join();
+  }
+  pool.Shutdown();
+  // 修复后容量检查与入队在同一临界区,任意时刻队列深度 <= cap。
+  // 原实现锁外预检查,并发提交可越过上限。
+  CHECK(max_seen.load() <= kCap);
+  CHECK(succeeded.load() > 0);
+}
+
+void TestDedupUnavailable() {
+  printf("[test] dedup: backend failure yields kError (not fake duplicate)\n");
+  dge::RedisClient::Config rcfg;
+  rcfg.host = "127.0.0.1";
+  rcfg.port = 1;  // 不可达端口
+  rcfg.io_threads = 1;
+  rcfg.io_queue_cap = 1;
+  dge::RedisClient client(rcfg, [](std::function<void()> fn) { fn(); });
+  std::atomic<int> results{0};
+  std::atomic<int> errors{0};
+  auto cb = [&](dge::RedisClient::DedupStatus st) {
+    ++results;
+    if (st == dge::RedisClient::DedupStatus::kError) {
+      ++errors;
+    }
+  };
+  // 第一个入队,第二个立即触发队列满 -> DropOp 路径。
+  client.SetNxAsync("k1", 60, cb);
+  client.SetNxAsync("k2", 60, cb);
+  for (int i = 0; i < 200 && results.load() < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  CHECK(results.load() == 2);
+  CHECK(errors.load() == 2);
+  client.Shutdown();
+}
+
 void TestConcurrentAddRemove() {
   printf("[test] concurrent updates + queries stay consistent\n");
   auto e = MakeEngines(500);
@@ -634,6 +1019,17 @@ int main() {
   TestWalSyncRecovery();
   TestWalSnapshotRecovery();
   TestWalTornWrite();
+  TestEpochReclaimSafety();
+  TestDuplicateEdgeAfterCompression();
+  TestBfsBudget();
+  TestWalSeqContinuity();
+  TestWalOpCodeTamper();
+  TestWalBadTailTruncate();
+  TestWalCheckpointConcurrent();
+  TestTimerEarlyTask();
+  TestHistogramBuckets();
+  TestThreadPoolAtomicCap();
+  TestDedupUnavailable();
   TestConcurrentAddRemove();
 
   printf("\n%d checks, %d failures\n", g_checks.load(), g_failures.load());

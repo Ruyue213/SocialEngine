@@ -922,6 +922,14 @@ void DynamicGraphEngine::Shutdown() {
   if (redis_) {
     redis_->Shutdown();
   }
+  // 修复:停机必须显式关闭 WAL。原实现遗漏此步,后台线程在引擎
+  // Shutdown 后仍每 2ms 触发 checkpoint(ftruncate + 快照覆盖),
+  // 若同路径迅速重启新引擎(恢复测试/热重启场景),两进程内实例
+  // 双写同一组文件,恢复结果不可预测。完整停机顺序:
+  // maint → timer → redis → wal → workers(完成回调排空)→ DrainPool。
+  if (wal_) {
+    wal_->Shutdown();
+  }
   workers_.Shutdown();
   EpochReclaimer::Instance().DrainPool(&pool_);
 }
