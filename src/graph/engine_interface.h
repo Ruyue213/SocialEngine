@@ -37,7 +37,8 @@ struct EngineStats {
   uint64_t updates = 0;
   uint64_t compactions = 0;
   uint64_t maintenance_scans = 0;
-  size_t memory_bytes = 0;
+  size_t memory_bytes = 0;   // 全账本:Slab+节点表+工作区
+  size_t slab_bytes = 0;     // 仅 Slab 池在用槽字节
 
   double cache_hit_rate() const {
     return cache_gets == 0 ? 0.0

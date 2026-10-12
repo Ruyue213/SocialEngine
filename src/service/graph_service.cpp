@@ -233,7 +233,9 @@ void GraphService::HandleEdge(net::HttpRequest&& req,
 
 void GraphService::HandleMetrics(std::function<void(int, std::string)> respond) {
   EngineStats s = engine_.stats();
-  metrics::SetGauge("engine_slab_bytes_in_use", s.memory_bytes);
+  // 修复:两个 gauge 各自对齐真实口径。原实现把全账本值
+  // 挂在 slab_bytes_in_use 名下,观测语义失真。
+  metrics::SetGauge("engine_slab_bytes_in_use", s.slab_bytes);
   metrics::SetGauge("engine_memory_bytes", s.memory_bytes);
   metrics::SetGauge("engine_cache_hit_rate", s.cache_gets == 0
                                                   ? 0

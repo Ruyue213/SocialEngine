@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -20,20 +21,20 @@
 
 namespace {
 
-int g_failures = 0;
-int g_checks = 0;
+// 修复:并发测试(TestConcurrentAddRemove)的 worker 线程会并发
+// 调 Check,原先普通 int 存在数据竞争,输出的 checks 数不可信。
+std::atomic<int> g_failures{0};
+std::atomic<int> g_checks{0};
 
 void Check(bool cond, const char* msg) {
-  ++g_checks;
+  g_checks.fetch_add(1, std::memory_order_relaxed);
   if (!cond) {
-    ++g_failures;
+    g_failures.fetch_add(1, std::memory_order_relaxed);
     printf("  [FAIL] %s\n", msg);
   }
 }
 
 #define CHECK(cond) Check((cond), #cond)
-
-std::vector<uint32_t> ToVec(const std::vector<uint32_t>& v) { return v; }
 
 void TestVarint() {
   printf("[test] varint roundtrip\n");
@@ -242,7 +243,7 @@ void TestRandomEquivalence(size_t nodes, uint64_t seed, int samples) {
       added.emplace_back(u, v);
     }
   }
-  for (size_t i = 0; i < samples; ++i) {
+  for (int i = 0; i < samples; ++i) {
     uint32_t u = 1 + rng() % nodes;
     uint32_t v = 1 + rng() % nodes;
     if (u == v) {
@@ -635,6 +636,6 @@ int main() {
   TestWalTornWrite();
   TestConcurrentAddRemove();
 
-  printf("\n%d checks, %d failures\n", g_checks, g_failures);
+  printf("\n%d checks, %d failures\n", g_checks.load(), g_failures.load());
   return g_failures == 0 ? 0 : 1;
 }

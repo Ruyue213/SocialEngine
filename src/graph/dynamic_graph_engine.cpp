@@ -222,6 +222,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
         int32_t d = 0;
         if (ok && !payload.empty() && ParseInt(payload, d)) {
           cache_hits_.fetch_add(1, std::memory_order_relaxed);
+          metrics::Inc("engine_cache_hits_total");
           FinishWithDistance(req, d);
           return;
         }
@@ -259,7 +260,7 @@ void DynamicGraphEngine::ProcessQuery(const std::shared_ptr<QueryRequest>& req) 
         friends = CommonFriends(req->a, req->b, ctx);
         uint32_t lo = std::min(req->a, req->b);
         uint32_t hi = std::max(req->a, req->b);
-        if (friends.size() <= 512) {
+        if (friends.size() <= cfg_.cache_max_friends) {
           redis_->SetAsync(CfKey(lo, hi), prefix + SerializeFriends(friends));
         }
         FinishWithFriends(req, std::move(friends));
@@ -320,6 +321,13 @@ void DynamicGraphEngine::FinishWithFriends(const std::shared_ptr<QueryRequest>& 
   res.friends = std::move(friends);
   queries_completed_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_queries_completed_total");
+  if (req->start_us > 0) {
+    uint64_t now_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    metrics::Observe("engine_query_duration_us", now_us - req->start_us);
+  }
   if (req->cb) {
     req->cb(std::move(res));
   }

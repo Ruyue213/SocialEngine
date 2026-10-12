@@ -48,11 +48,21 @@ void TimerHeap::RunLoop() {
       auto due = std::chrono::time_point<std::chrono::steady_clock>(
           std::chrono::milliseconds(heap_.top().due_ms));
       if (due > now) {
-        cv_.wait_until(lk, due, [this] { return stop_; });
+        // 修复:等待谓词须感知堆顶变化。原谓词只检查 stop_,
+        // 新任务通过 cv_.notify_one 唤醒本线程后谓词仍为假,
+        // wait_until 继续睡到旧的截止时间——比当前堆顶更早的新
+        // 任务被拖延到旧任务到期后才执行(已复现:300ms 任务
+        // 等待期间插入 15ms 任务,实测 336ms 才执行)。
+        // 现在记录等待时的堆顶 seq,任何插入改变了堆顶都会让
+        // 谓词为真,循环重评估新的最近截止时间。
+        uint64_t top_seq = heap_.top().seq;
+        cv_.wait_until(lk, due, [this, top_seq] {
+          return stop_ || heap_.empty() || heap_.top().seq != top_seq;
+        });
         if (stop_) {
           return;
         }
-        continue;
+        continue;  // 重新检查堆顶(可能已被更早的任务替换)
       }
       fn = heap_.top().fn;
       heap_.pop();
