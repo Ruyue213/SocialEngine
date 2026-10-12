@@ -21,8 +21,9 @@ HIREDIS_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(HIREDIS_SRC))
 BENCH_OBJ := $(BUILD)/obj/bench/bench_main.o
 TEST_OBJ := $(BUILD)/obj/tests/test_main.o
 SERVER_OBJ := $(BUILD)/obj/server/server_main.o
+EPOLL_SMOKE_OBJ := $(BUILD)/obj/tests/epoll_smoke.o
 
-all: $(BIN)/bench $(BIN)/tests $(BIN)/server
+all: $(BIN)/bench $(BIN)/tests $(BIN)/server $(BIN)/epoll_smoke
 
 $(BUILD)/obj/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
@@ -52,6 +53,15 @@ $(BIN)/server: $(SERVER_OBJ) $(ENGINE_OBJ) $(HIREDIS_OBJ)
 	@mkdir -p $(BIN)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+# epoll 语义单测(仅 Linux 链接真实分支;其他平台编译为跳过桩)
+$(BIN)/epoll_smoke: $(EPOLL_SMOKE_OBJ) $(BUILD)/obj/net/poller.o $(BUILD)/obj/net/wake_fd.o
+	@mkdir -p $(BIN)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/obj/tests/epoll_smoke.o: tests/epoll_smoke.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 asan:
 	$(MAKE) CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc -Ithird_party/hiredis -MMD -MP"
 
@@ -63,8 +73,9 @@ fuzz:
 debug:
 	$(MAKE) CXXFLAGS="-std=c++17 -O0 -g -Wall -Wextra -Isrc -Ithird_party/hiredis -MMD -MP"
 
-test: $(BIN)/tests
+test: $(BIN)/tests $(BIN)/epoll_smoke
 	./$(BIN)/tests
+	./$(BIN)/epoll_smoke
 
 bench: $(BIN)/bench
 	./$(BIN)/bench
@@ -72,7 +83,7 @@ bench: $(BIN)/bench
 clean:
 	rm -rf $(BUILD) $(BIN)
 
-DEPFILES := $(ENGINE_OBJ:.o=.d) $(HIREDIS_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(SERVER_OBJ:.o=.d)
+DEPFILES := $(ENGINE_OBJ:.o=.d) $(HIREDIS_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(SERVER_OBJ:.o=.d) $(EPOLL_SMOKE_OBJ:.o=.d)
 -include $(DEPFILES)
 
 .PHONY: all asan debug test bench clean
