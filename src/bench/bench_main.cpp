@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
@@ -203,6 +204,7 @@ struct ZipfSampler {
 struct BenchCtx {
   std::array<std::atomic<uint64_t>, kLatBuckets> hist;
   std::atomic<uint64_t> completed{0};
+  std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> sum_us{0};
   std::atomic<uint64_t> shed{0};
   std::atomic<uint64_t> updates_done{0};
@@ -280,7 +282,7 @@ enum class OpType : uint8_t { kCommonFriends, kSecondDegree, kDistance, kAddEdge
 void ClientLoop(IGraphEngine& engine, BenchCtx& ctx, const BenchArgs& args, size_t client_id,
                 const std::vector<std::pair<uint32_t, uint32_t>>& edges,
                 std::atomic<bool>& run, std::atomic<uint64_t>& seq_counter,
-                const ZipfSampler& zipf) {
+                const ZipfSampler& zipf, bool queries_only = false) {
   std::mt19937_64 rng(args.seed ^ (client_id * 0x9E3779B97F4A7C15ULL));
   uint32_t n = static_cast<uint32_t>(args.nodes);
   bool use_zipf = args.zipf > 0.0 && zipf.cdf.size() > 1;
@@ -312,6 +314,9 @@ void ClientLoop(IGraphEngine& engine, BenchCtx& ctx, const BenchArgs& args, size
       op = OpType::kRemoveEdge;
     }
 
+    if (queries_only && (op == OpType::kAddEdge || op == OpType::kRemoveEdge)) {
+      op = OpType::kCommonFriends;  // 预热期不更新图,保持测量初始状态一致
+    }
     if (op == OpType::kAddEdge) {
       uint32_t u = 1 + static_cast<uint32_t>(rng() % n);
       uint32_t v = 1 + static_cast<uint32_t>(rng() % n);
@@ -367,6 +372,7 @@ void ClientLoop(IGraphEngine& engine, BenchCtx& ctx, const BenchArgs& args, size
         Record(ctx, us);
       };
       if (engine.Submit(std::move(req))) {
+        ctx.submitted.fetch_add(1, std::memory_order_relaxed);
         break;
       }
       ctx.shed.fetch_add(1, std::memory_order_relaxed);
@@ -459,16 +465,17 @@ void PrintLatency(BenchCtx& ctx, const char* label) {
     h[i] = ctx.hist[i].load(std::memory_order_relaxed);
     cum += h[i];
   }
+  // 桶 i 覆盖 [2^i, 2^(i+1));返回桶上界,报告值 >= 真实值的保守估计。
   auto pctl = [&](double p) {
     uint64_t target = static_cast<uint64_t>(cum * p);
     uint64_t acc = 0;
     for (int i = 0; i < kLatBuckets; ++i) {
       acc += h[i];
       if (acc >= target) {
-        return (1ULL << i);
+        return (1ULL << (i + 1));
       }
     }
-    return 1ULL << (kLatBuckets - 1);
+    return 1ULL << kLatBuckets;
   };
   double avg = static_cast<double>(ctx.sum_us.load(std::memory_order_relaxed)) / total;
   printf("  %-8s: avg %.0fus | p50 %lluus | p90 %lluus | p99 %lluus | p999 %lluus | max %lluus\n",
@@ -655,12 +662,15 @@ RunResult RunEngine(IGraphEngine& engine, const BenchArgs& args,
   std::atomic<bool> run{false};
   std::atomic<uint64_t> seq{0};
 
+  // 预热:纯查询负载。原实现预热含更新,两个引擎的图沿不同路径
+  // 演化,正式对比不在同一初始状态上。
   std::vector<std::thread> warmers;
   warmers.reserve(args.clients);
   run.store(true, std::memory_order_relaxed);
   for (size_t i = 0; i < args.clients; ++i) {
     warmers.emplace_back([&, i]() {
-      ClientLoop(engine, discard, args, i, edges, run, seq, zipf);
+      ClientLoop(engine, discard, args, i, edges, run, seq, zipf,
+                 /*queries_only=*/true);
     });
   }
   std::this_thread::sleep_for(std::chrono::seconds(args.warmup));
@@ -669,6 +679,10 @@ RunResult RunEngine(IGraphEngine& engine, const BenchArgs& args,
     t.join();
   }
 
+  // 正式测量:分子(完成量)与分母(真实墙钟,含排空)自洽。
+  // 原实现分母固定为 args.seconds,join 与排空期完成的请求被
+  // 额外计入分子,QPS 被高估。
+  auto t_measure_start = std::chrono::steady_clock::now();
   std::vector<std::thread> mclients;
   mclients.reserve(args.clients);
   run.store(true, std::memory_order_relaxed);
@@ -683,19 +697,25 @@ RunResult RunEngine(IGraphEngine& engine, const BenchArgs& args,
     t.join();
   }
 
+  // 排空:只等 meas 在飞完成(原条件用引擎累计计数,含预热期
+  // 请求,可能提前满足)。
   for (int i = 0; i < 1500; ++i) {
-    dge::EngineStats s = engine.stats();
-    if (s.queries_completed >= s.queries_submitted - s.shed_count) {
+    if (meas.submitted.load(std::memory_order_relaxed) ==
+        meas.completed.load(std::memory_order_relaxed) +
+            meas.shed.load(std::memory_order_relaxed)) {
       break;
     }
     SleepUs(10000);
   }
+  auto t_measure_end = std::chrono::steady_clock::now();
+  double actual_seconds =
+      std::chrono::duration<double>(t_measure_end - t_measure_start).count();
   engine.Shutdown();
 
-  PrintStats(engine, meas, args.seconds, label, note);
+  PrintStats(engine, meas, actual_seconds, label, note);
   dge::EngineStats s = engine.stats();
   RunResult r;
-  r.qps = static_cast<double>(meas.completed.load(std::memory_order_relaxed)) / args.seconds;
+  r.qps = static_cast<double>(meas.completed.load(std::memory_order_relaxed)) / actual_seconds;
   r.avg_us = meas.completed.load(std::memory_order_relaxed) > 0
                  ? static_cast<double>(meas.sum_us.load(std::memory_order_relaxed)) /
                        meas.completed.load(std::memory_order_relaxed)
@@ -710,6 +730,9 @@ RunResult RunEngine(IGraphEngine& engine, const BenchArgs& args,
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  // 压测客户端必须忽略 SIGPIPE:服务端过载关连接时,向已关闭
+  // socket 的 write 会以 SIGPIPE 终止压测进程(exit=141)。
+  std::signal(SIGPIPE, SIG_IGN);
   BenchArgs args;
   if (!ParseArgs(argc, argv, args)) {
     return 1;

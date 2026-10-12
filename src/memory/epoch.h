@@ -51,6 +51,8 @@ class EpochReclaimer {
     SlabPool* pool;
   };
 
+  static void FreedBatch(std::vector<RetireEntry>& entries);
+
   std::atomic<uint64_t> g_epoch_{1};
   std::mutex retire_mu_;
   std::vector<RetireEntry> retire_lists_[kBuckets];

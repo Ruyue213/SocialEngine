@@ -384,11 +384,22 @@ void rebuild_blocks(SlabPool& pool, NodeAdjacency& adj, const std::vector<uint32
     ++i;
   }
 
-  uint64_t* nt = NewTail(pool, 8);
+  // 修复:重建后尾容量随度数增长(原先固定 8 槽)。高度节点每 8
+  // 次插入即再次触发全量重建,单节点累计代价 O(d^2/8);按规模
+  // 设置尾容量后,两次重建之间可积累与度数成比例的增量,摊销
+  // 重建成本。上限 512 槽与尾档位对齐,兼顾低频更新节点的内存。
+  size_t tail_cap = 8;
+  if (live.size() > 32) {
+    tail_cap = std::min<size_t>(512, live.size() / 2);
+    if (tail_cap < 8) {
+      tail_cap = 8;
+    }
+  }
+  uint64_t* nt = NewTail(pool, tail_cap);
   // 修复:先构建完整新版本再一次原子发布,消除原先
   // exchange(nullptr) → store(nd) 之间读者观察到空邻接的窗口。
   // 旧版本(含旧块链与旧尾)整体交由 EBR 延迟回收。
-  AdjacencyData* nd = NewData(pool, new_head, nt, 8, 0, 0);
+  AdjacencyData* nd = NewData(pool, new_head, nt, static_cast<uint32_t>(tail_cap), 0, 0);
   AdjacencyData* d = adj.data.load(std::memory_order_relaxed);
   adj.data.store(nd, std::memory_order_release);
   if (d != nullptr) {

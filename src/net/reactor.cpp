@@ -127,9 +127,9 @@ void HttpServer::FlushResponses(SubReactor* sr, Conn* c) {
     if (it == c->resp_map.end()) {
       break;
     }
-    if (it->second.first == 503) {
-      c->close_after = true;
-    }
+    // 503 不再强制断连:Retry-After 语义是「稍后重试」,连接应
+    // 保留复用。原实现过载即断连,客户端重连风暴放大压力,且
+    // 对端若未忽略 SIGPIPE 会被直接杀死(压测中复现 exit=141)。
     CompactSentPrefix(c);
     c->out += it->second.second;
     c->resp_map.erase(it);

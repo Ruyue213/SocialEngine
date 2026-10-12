@@ -101,13 +101,14 @@ void TestSlabWildNext() {
   uint8_t* raw = static_cast<uint8_t*>(a);
   uint64_t wild = 0xDEADDEADDEADDEADULL;
   std::memcpy(raw, &wild, 8);
-  bool threw = false;
-  try {
-    pool.Allocate(128);
-  } catch (const std::runtime_error&) {
-    threw = true;
-  }
-  CHECK(threw);
+  // 野 next 指针的检测点在诊断接口 ValidateFreeBlock(保留完整
+  // 页归属校验);分配热路径只做 O(1) 魔数校验(见 slab_pool.cpp
+  // 的 profiling 取舍注释)。
+  CHECK(!pool.ValidateFreeBlock(a, 128));
+  // 魔数未破坏时热路径分配仍安全(取走槽后野指针不再被解引用)。
+  void* b = pool.Allocate(128);
+  CHECK(b == a);
+  pool.Deallocate(b, 128);
 }
 
 void TestThreadPoolShed() {
