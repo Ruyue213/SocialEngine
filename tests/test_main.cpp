@@ -956,6 +956,56 @@ void TestDedupUnavailable() {
   client.Shutdown();
 }
 
+
+void TestEpochInterleaveStress() {
+  printf("[test] EBR: pin/sweep interleave stress (Dekker recheck)\n");
+  // Dekker 双检协议的工程验证:多读者高频 Pin/Unpin 与并发 Sweep
+  // 交错,Retire 的对象在读者持有期间不得释放。配合 ASAN 运行。
+  auto* r = &dge::EpochReclaimer::Instance();
+  r->Sweep();
+  r->Sweep();
+  CHECK(r->retired_pending() == 0);
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> pin_cycles{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 4; ++t) {
+    threads.emplace_back([&, t]() {
+      std::mt19937_64 rng(7000 + t);
+      for (int i = 0; i < 3000 && !stop.load(); ++i) {
+        uint32_t ticket = r->Pin();
+        // 模拟受保护区:短暂持有后 Unpin。
+        if (rng() % 8 == 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+        r->Unpin(ticket);
+        pin_cycles.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  // 写者线程:Retire 对象(读值即弃,验证不提前释放)。
+  threads.emplace_back([&]() {
+    for (int i = 0; i < 6000 && !stop.load(); ++i) {
+      void* p = std::malloc(64);
+      r->Retire(p, 64, nullptr);
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  });
+  for (int i = 0; i < 3000; ++i) {
+    r->Sweep();
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+  for (auto& th : threads) {
+    if (th.joinable()) {
+      th.join();
+    }
+  }
+  // 清场:所有读者退出后再两轮 Sweep 应清空 pending。
+  r->Sweep();
+  r->Sweep();
+  CHECK(pin_cycles.load() > 1000);
+  CHECK(r->retired_pending() == 0);
+}
+
 void TestConcurrentAddRemove() {
   printf("[test] concurrent updates + queries stay consistent\n");
   auto e = MakeEngines(500);
@@ -1021,6 +1071,7 @@ int main() {
   TestWalSnapshotRecovery();
   TestWalTornWrite();
   TestEpochReclaimSafety();
+  TestEpochInterleaveStress();
   TestDuplicateEdgeAfterCompression();
   TestBfsBudget();
   TestWalSeqContinuity();

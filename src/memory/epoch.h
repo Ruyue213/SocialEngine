@@ -52,6 +52,7 @@ class EpochReclaimer {
   };
 
   static void FreedBatch(std::vector<RetireEntry>& entries);
+  void RegisterSlot(uint32_t slot);
 
   std::atomic<uint64_t> g_epoch_{1};
   std::mutex retire_mu_;
