@@ -57,7 +57,7 @@ class DynamicGraphEngine : public IGraphEngine {
     int redis_io_threads = 4;
     int redis_ttl_seconds = 120;
     int double_delete_delay_ms = 5;
-    uint32_t max_bfs_depth = 32;
+    uint32_t max_bfs_depth = 32;  // 候选路径长度上限;-1=预算内未找到
     size_t keep_tail_threshold = 256;
     double hole_ratio_threshold = 0.4;
     size_t cache_max_friends = 512;

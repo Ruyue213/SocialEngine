@@ -338,6 +338,10 @@ int32_t DynamicGraphEngine::BidirectionalBfs(uint32_t src, uint32_t dst,
   if (src == dst) {
     return 0;
   }
+  // 引擎级兜底:防止绕过服务层校验的直接调用越界访问 adj_。
+  if (src == 0 || dst == 0 || src > nodes_ || dst > nodes_) {
+    return -1;
+  }
   const uint32_t max_depth = cfg_.max_bfs_depth;
   uint32_t e1 = ctx.NextEpoch();
   uint32_t e2 = ctx.NextEpoch();
@@ -366,10 +370,17 @@ int32_t DynamicGraphEngine::BidirectionalBfs(uint32_t src, uint32_t dst,
   };
 
   while (!fa.empty() && !fb.empty() && found < 0) {
+    // 修复:预算语义为「候选路径长度上限」。原实现只检查被选中
+    // 扩展一侧的深度:cap=1 时链 1-2-3 返回 -1,为 1 增加一条
+    // 支路后反而返回 2(超出预算),同一配置下结果互相矛盾。
+    // 现在统一检查两侧深度之和:若最短路 L <= 预算,交替扩展
+    // 较小侧保证相遇发生在 dist_a + dist_b <= L 之前,不会
+    // 提前停止;和达到预算仍未相遇,则不存在预算内路径。
+    // 返回 -1 的语义相应明确为「预算内未找到」(不区分不可达)。
+    if (dist_a + dist_b >= max_depth) {
+      break;
+    }
     if (fa.size() <= fb.size()) {
-      if (dist_a >= max_depth) {
-        break;
-      }
       na.clear();
       for (uint32_t x : fa) {
         ForEachNeighbor(x, [&](uint32_t n) {
@@ -385,9 +396,6 @@ int32_t DynamicGraphEngine::BidirectionalBfs(uint32_t src, uint32_t dst,
       fa.swap(na);
       ++dist_a;
     } else {
-      if (dist_b >= max_depth) {
-        break;
-      }
       nb.clear();
       for (uint32_t x : fb) {
         ForEachNeighbor(x, [&](uint32_t n) {
@@ -409,6 +417,9 @@ int32_t DynamicGraphEngine::BidirectionalBfs(uint32_t src, uint32_t dst,
 
 std::vector<uint32_t> DynamicGraphEngine::SecondDegreeBfs(uint32_t src,
                                                           WorkerCtx& ctx) {
+  if (src == 0 || src > nodes_) {
+    return {};
+  }
   uint32_t e = ctx.NextEpoch();
   std::vector<uint32_t>& level1 = ctx.scratch;
   std::vector<uint32_t>& level2 = ctx.scratch2;
@@ -435,6 +446,9 @@ std::vector<uint32_t> DynamicGraphEngine::SecondDegreeBfs(uint32_t src,
 
 std::vector<uint32_t> DynamicGraphEngine::CommonFriends(uint32_t u, uint32_t v,
                                                         WorkerCtx& ctx) {
+  if (u == 0 || v == 0 || u > nodes_ || v > nodes_) {
+    return {};
+  }
   std::vector<uint32_t>& sa = ctx.scratch;
   std::vector<uint32_t>& sb = ctx.scratch2;
   storage::NodeAdjacency& au = adj_[u];
