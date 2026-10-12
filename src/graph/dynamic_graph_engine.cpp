@@ -459,6 +459,13 @@ void DynamicGraphEngine::ForEachNeighbor(uint32_t u,
 
 bool DynamicGraphEngine::PrepareAddToNode(uint32_t node, uint32_t id) {
   storage::NodeAdjacency& adj = adj_[node];
+  // 修复:重复边判定必须在桶独占锁内覆盖完整邻接(压缩块+尾部)。
+  // 原实现 tail_add 只检查尾部,已进入压缩块的边可被再次插入,
+  // 破坏简单图集合语义与差值编码的严格递增前提。
+  // 桶锁保证检查与插入原子,无并发窗口。
+  if (storage::node_contains(adj, id)) {
+    return false;
+  }
   for (int attempt = 0; attempt < 2; ++attempt) {
     storage::TailAddResult r = storage::tail_add(pool_, adj, id);
     if (r == storage::TailAddResult::kDuplicate) {

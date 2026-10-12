@@ -40,8 +40,6 @@ void RetireTail(SlabPool& pool, uint64_t* tail, uint32_t cap_entries) {
   }
 }
 
-bool ReadersActive() { return EpochReclaimer::Instance().ReadersActive(); }
-
 }  // namespace
 
 size_t block_free_space(const uint8_t* block) {
@@ -98,12 +96,12 @@ bool block_remove(SlabPool& pool, NodeAdjacency& adj, uint32_t id, bool& found) 
       }
       cur += delta;
       if (cur == id && !bit_is_set(b, i)) {
-        if (!ReadersActive()) {
-          bit_set(b, i);
-          ++h->deleted;
-          found = true;
-          return true;
-        }
+        // 统一 COW:不做「检查 ReadersActive 后原地置位」的快路径。
+        // 原地修改已发布块存在两类问题:(1) 检查与修改之间读者可
+        // 进入,与遍历中的读者构成数据竞争;(2) 老块可能被多个已
+        // 发布版本共享(前缀 COW + 共享后缀),原地修改会波及持有
+        // 旧版本的读者。复制目标链后原子发布,旧链整体交由 EBR
+        // 延迟回收。
         uint8_t* new_head = nullptr;
         uint8_t* last_new = nullptr;
         uint8_t* walk = d->head;
@@ -157,21 +155,21 @@ TailAddResult tail_add(SlabPool& pool, NodeAdjacency& adj, uint64_t id) {
     }
     return TailAddResult::kAdded;
   }
+  // 统一 COW:尾部数组同样是已发布对象的一部分,读者可能在遍历中。
+  // 原地写入(利用 len/deleted 的原子性)会与读者构成数据竞争,
+  // 因此任何修改都复制新尾再原子发布,旧尾交由 EBR 延迟回收。
   uint64_t* work = d->tail;
   uint32_t len = d->len.load(std::memory_order_acquire);
   uint32_t deleted = d->deleted.load(std::memory_order_relaxed);
-  if (ReadersActive()) {
-    uint64_t* clone = NewTail(pool, d->cap);
-    std::memcpy(clone, d->tail, static_cast<size_t>(d->len) * sizeof(uint64_t));
-    work = clone;
-  }
+  uint32_t cap = d->cap.load(std::memory_order_relaxed);
+  uint64_t* clone = NewTail(pool, cap);
+  std::memcpy(clone, d->tail, static_cast<size_t>(len) * sizeof(uint64_t));
+  work = clone;
   uint32_t hole = 0;
   bool has_hole = false;
   for (uint32_t i = 0; i < len; ++i) {
     if (work[i] == id) {
-      if (work != d->tail) {
-        RetireTail(pool, work, d->cap);
-      }
+      RetireTail(pool, work, cap);
       return TailAddResult::kDuplicate;
     }
     if (work[i] == kDeletedTail && !has_hole) {
@@ -182,33 +180,21 @@ TailAddResult tail_add(SlabPool& pool, NodeAdjacency& adj, uint64_t id) {
   if (has_hole) {
     work[hole] = id;
     --deleted;
-    if (work != d->tail) {
-      AdjacencyData* nd =
-          NewData(pool, d->head, work, d->cap.load(std::memory_order_relaxed), len, deleted);
-      adj.data.store(nd, std::memory_order_release);
-      RetireData(pool, d);
-      RetireTail(pool, d->tail, d->cap.load(std::memory_order_relaxed));
-    } else {
-      d->deleted.store(deleted, std::memory_order_release);
-    }
+    AdjacencyData* nd = NewData(pool, d->head, work, cap, len, deleted);
+    adj.data.store(nd, std::memory_order_release);
+    RetireData(pool, d);
+    RetireTail(pool, d->tail, cap);
     return TailAddResult::kAdded;
   }
-  if (len >= d->cap.load(std::memory_order_relaxed)) {
-    if (work != d->tail) {
-      RetireTail(pool, work, d->cap);
-    }
+  if (len >= cap) {
+    RetireTail(pool, work, cap);
     return TailAddResult::kFull;
   }
   work[len] = id;
-  if (work != d->tail) {
-    AdjacencyData* nd = NewData(pool, d->head, work, d->cap.load(std::memory_order_relaxed),
-                                len + 1, deleted);
-    adj.data.store(nd, std::memory_order_release);
-    RetireData(pool, d);
-    RetireTail(pool, d->tail, d->cap.load(std::memory_order_relaxed));
-  } else {
-    d->len.store(len + 1, std::memory_order_release);
-  }
+  AdjacencyData* nd = NewData(pool, d->head, work, cap, len + 1, deleted);
+  adj.data.store(nd, std::memory_order_release);
+  RetireData(pool, d);
+  RetireTail(pool, d->tail, cap);
   return TailAddResult::kAdded;
 }
 
@@ -217,33 +203,24 @@ bool tail_remove(SlabPool& pool, NodeAdjacency& adj, uint64_t id) {
   if (d == nullptr || d->tail == nullptr) {
     return false;
   }
-  uint64_t* work = d->tail;
+  // 统一 COW,理由同 tail_add。
   uint32_t len = d->len.load(std::memory_order_acquire);
   uint32_t deleted = d->deleted.load(std::memory_order_relaxed);
-  if (ReadersActive()) {
-    uint64_t* clone = NewTail(pool, d->cap);
-    std::memcpy(clone, d->tail, static_cast<size_t>(d->len) * sizeof(uint64_t));
-    work = clone;
-  }
+  uint32_t cap = d->cap.load(std::memory_order_relaxed);
+  uint64_t* work = NewTail(pool, cap);
+  std::memcpy(work, d->tail, static_cast<size_t>(len) * sizeof(uint64_t));
   for (uint32_t i = 0; i < len; ++i) {
     if (work[i] == id) {
       work[i] = kDeletedTail;
       ++deleted;
-      if (work != d->tail) {
-        AdjacencyData* nd = NewData(pool, d->head, work,
-                                    d->cap.load(std::memory_order_relaxed), len, deleted);
-        adj.data.store(nd, std::memory_order_release);
-        RetireData(pool, d);
-        RetireTail(pool, d->tail, d->cap.load(std::memory_order_relaxed));
-      } else {
-        d->deleted.store(deleted, std::memory_order_release);
-      }
+      AdjacencyData* nd = NewData(pool, d->head, work, cap, len, deleted);
+      adj.data.store(nd, std::memory_order_release);
+      RetireData(pool, d);
+      RetireTail(pool, d->tail, cap);
       return true;
     }
   }
-  if (work != d->tail) {
-    RetireTail(pool, work, d->cap);
-  }
+  RetireTail(pool, work, cap);
   return false;
 }
 
@@ -251,6 +228,42 @@ bool tail_contains(const NodeAdjacency& adj, uint64_t id) {
   const AdjacencyData* d = adj.data.load(std::memory_order_relaxed);
   if (d == nullptr || d->tail == nullptr) {
     return false;
+  }
+  uint32_t len = d->len.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < len; ++i) {
+    if (d->tail[i] == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool node_contains(const NodeAdjacency& adj, uint32_t id) {
+  const AdjacencyData* d = adj.data.load(std::memory_order_acquire);
+  if (d == nullptr) {
+    return false;
+  }
+  uint8_t* b = d->head;
+  while (b != nullptr) {
+    const BlockHeader* h = header_of(b);
+    const uint8_t* p = data_of(b);
+    const uint8_t* end = p + h->data_end;
+    uint64_t cur = 0;
+    for (uint32_t i = 0; i < h->count; ++i) {
+      uint64_t delta = 0;
+      p = get_varint(p, end, delta);
+      if (p == nullptr) {
+        return false;
+      }
+      cur += delta;
+      if (cur == id && !bit_is_set(b, i)) {
+        return true;
+      }
+      if (cur > id) {
+        return false;  // 块内有序,可提前退出
+      }
+    }
+    b = h->next;
   }
   uint32_t len = d->len.load(std::memory_order_acquire);
   for (uint32_t i = 0; i < len; ++i) {
@@ -304,6 +317,11 @@ size_t gather_live(const NodeAdjacency& adj, std::vector<uint32_t>& out) {
   out.reserve(node_live_count(adj) + 8);
   node_iterate(adj, [&out](uint32_t id) { out.push_back(id); });
   std::sort(out.begin(), out.end());
+  // 防御性去重:重建前的 live 序列必须严格递增,这是压缩差值编码
+  // 正确性与简单图集合语义的共同前提。正常路径下调用方已保证
+  // 无重复(AddEdge 在桶锁内先做全邻接存在性检查),此处兜底,
+  // 防御历史数据或其它路径引入的重复。
+  out.erase(std::unique(out.begin(), out.end()), out.end());
   return out.size();
 }
 
@@ -367,8 +385,12 @@ void rebuild_blocks(SlabPool& pool, NodeAdjacency& adj, const std::vector<uint32
   }
 
   uint64_t* nt = NewTail(pool, 8);
-  AdjacencyData* d = adj.data.exchange(nullptr, std::memory_order_relaxed);
-  adj.data.store(NewData(pool, new_head, nt, 8, 0, 0), std::memory_order_release);
+  // 修复:先构建完整新版本再一次原子发布,消除原先
+  // exchange(nullptr) → store(nd) 之间读者观察到空邻接的窗口。
+  // 旧版本(含旧块链与旧尾)整体交由 EBR 延迟回收。
+  AdjacencyData* nd = NewData(pool, new_head, nt, 8, 0, 0);
+  AdjacencyData* d = adj.data.load(std::memory_order_relaxed);
+  adj.data.store(nd, std::memory_order_release);
   if (d != nullptr) {
     RetireData(pool, d);
     uint8_t* old_head = d->head;

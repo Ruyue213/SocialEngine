@@ -76,6 +76,10 @@ bool tail_remove(SlabPool& pool, NodeAdjacency& adj, uint64_t id);
 
 bool tail_contains(const NodeAdjacency& adj, uint64_t id);
 
+// 全邻接存在性检查:压缩块(有序,可提前退出)+ 尾部。
+// 简单图集合语义的唯一正确入口:重复边判定不能只查尾部。
+bool node_contains(const NodeAdjacency& adj, uint32_t id);
+
 void node_iterate(uint8_t* head, const uint64_t* tail, uint32_t tail_len,
                   const std::function<void(uint32_t)>& fn);
 
