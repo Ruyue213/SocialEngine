@@ -551,37 +551,41 @@ bool DynamicGraphEngine::AddEdge(uint32_t u, uint32_t v) {
   if (b2 != b1) {
     lk2.lock();
   }
-  // 完整删除语义:尾满重建会把刚插入的边固化进压缩块,撤销不能
-  // 只清尾部(原实现缺陷:第二端点失败时第一端点的边可能残留在
-  // 压缩块中,破坏双端对称不变量)。
-  auto rollback_edge = [&](uint32_t x, uint32_t y) {
-    bool f = storage::tail_remove(pool_, adj_[x], y);
-    if (!f) {
-      storage::block_remove(pool_, adj_[x], y, f);
+  // WAL-ahead 顺序:先记日志,后改内存(2026-10 第二轮审查重构)。
+  // 原实现「先内存后日志 + 失败回滚」存在两个问题:(1) 回滚期间
+  // 并发查询可观察到「未持久确认」的中间状态,可见性与确认点非
+  // 线性化;(2) 回滚本身走删除路径,失败分支的复杂度与内存交互
+  // 面大。先 Append 后应用后:Append 失败时内存未被触碰,直接
+  // 返回 false,无回滚代码。代价是重复 Add 等幂等失败场景也会留
+  // 下日志记录,恢复重放时由 AddEdge/RemoveEdge 的集合语义自然
+  // 幂等(重复应用为 no-op),无正确性影响。
+  // 线性化/持久化语义:
+  //   sync 档:返回 true ⟺ 该更新已 fsync 落盘且已在内存发布;
+  //   组提交档:返回 true ⟺ 该更新已入缓冲(至多一个后台刷盘
+  //             周期 ≈2ms 的丢失窗口,崩溃时可能丢失已确认更新,
+  //             由启动参数明示)。
+  // 崩溃在「fsync 完成、内存未应用」之间:恢复重放应用该更新,
+  // 客户端未收到响应——at-least-once + 幂等重放,允许且已声明。
+  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
+      !recovering_.load(std::memory_order_relaxed)) {
+    if (!wal_->Append(0x01, u, v)) {
+      return false;
     }
-  };
+  }
   if (!PrepareAddToNode(u, v)) {
     return false;
   }
   if (!PrepareAddToNode(v, u)) {
-    rollback_edge(u, v);
+    // 第二端失败(并发下极小窗口):WAL 已记录 add,重放幂等,
+    // 无需补偿。内存侧用完整删除语义恢复对称。
+    bool f = storage::tail_remove(pool_, adj_[u], v);
+    if (!f) {
+      storage::block_remove(pool_, adj_[u], v, f);
+    }
     return false;
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_updates_total");
-  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
-      !recovering_.load(std::memory_order_relaxed)) {
-    // 修复:传播 Append 失败。原先忽略返回值,刷盘错误被吞掉,
-    // 调用方收到成功但更新不可恢复。失败时回滚内存侧,保证
-    // 「返回 true ⟺ 更新已进入 WAL」(组提交档为已入缓冲)。
-    if (!wal_->Append(0x01, u, v)) {
-      rollback_edge(u, v);
-      rollback_edge(v, u);
-      updates_.fetch_sub(1, std::memory_order_relaxed);
-      DGE_LOG_ERROR("wal append failed, add(%u,%u) rolled back", u, v);
-      return false;
-    }
-  }
 #ifdef DGE_VERIFY
   {
     for (uint32_t node : {u, v}) {
@@ -618,6 +622,16 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
     lk2.lock();
   }
 
+  // WAL-ahead(与 AddEdge 完全对称):先记日志,后改内存。
+  // Append 失败时内存未触碰,直接返回 false——两个更新接口均无
+  // 回滚代码。边不存在的场景会在 WAL 留下 del 记录,重放幂等。
+  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
+      !recovering_.load(std::memory_order_relaxed)) {
+    if (!wal_->Append(0x02, u, v)) {
+      return false;
+    }
+  }
+
   bool found_u = storage::tail_remove(pool_, adj_[u], v);
   if (!found_u) {
     storage::block_remove(pool_, adj_[u], v, found_u);
@@ -632,22 +646,6 @@ bool DynamicGraphEngine::RemoveEdge(uint32_t u, uint32_t v) {
   }
   updates_.fetch_add(1, std::memory_order_relaxed);
   metrics::Inc("engine_updates_total");
-  if (wal_ && wal_enabled_.load(std::memory_order_relaxed) &&
-      !recovering_.load(std::memory_order_relaxed)) {
-    // 修复:Append 失败时把边加回,保证内存状态与「未确认持久化」
-    // 一致,调用方语义与 AddEdge 对称。回滚走完整 PrepareAddToNode
-    // (含尾满重建),忽略返回值并记日志——Append 失败属于极端故障
-    // 路径,回滚后即使尾满也会在下一轮整理收敛。
-    if (!wal_->Append(0x02, u, v)) {
-      if (!PrepareAddToNode(u, v) || !PrepareAddToNode(v, u)) {
-        DGE_LOG_ERROR("wal append failed and rollback incomplete for remove(%u,%u)", u, v);
-      } else {
-        DGE_LOG_ERROR("wal append failed, remove(%u,%u) rolled back", u, v);
-      }
-      updates_.fetch_sub(1, std::memory_order_relaxed);
-      return false;
-    }
-  }
   if (storage::node_needs_compaction(adj_[u], cfg_.hole_ratio_threshold)) {
     MarkDirty(u);
   }

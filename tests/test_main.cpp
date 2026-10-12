@@ -842,6 +842,72 @@ void TestWalCheckpointConcurrent() {
   rec->Shutdown();
 }
 
+
+void TestWalAppendFailureIsolation() {
+  printf("[test] wal-ahead: append failure leaves memory untouched\n");
+  dge::DynamicGraphEngine::Config cfg;
+  cfg.nodes = 50;
+  cfg.buckets = 4;
+  cfg.pool_threads = 2;
+  cfg.cache_enabled = false;
+  cfg.wal_path = "/nonexistent_dir_dge/wal.log";  // open 必败
+  cfg.wal_sync_mode = true;
+  dge::DynamicGraphEngine eng(cfg);
+  CHECK(!eng.AddEdge(1, 2));
+  CHECK(!eng.RemoveEdge(3, 4));
+  // 内存未被触碰:两点不可达。
+  CHECK(SyncQuery(eng, dge::QueryType::kDistance, 1, 2).distance == -1);
+  eng.Shutdown();
+}
+
+void TestWalCrashBetweenRenameAndRotate() {
+  printf("[test] wal: snapshot renamed but wal not rotated (crash state)\n");
+  const char* dir = "/tmp/dge_wal_crashsim";
+  std::string cmd = "rm -rf " + std::string(dir) + " && mkdir -p " + std::string(dir);
+  system(cmd.c_str());
+  std::string wal_path = std::string(dir) + "/wal.log";
+  std::string snap_path = std::string(dir) + "/snap.bin";
+  auto mk = [&]() {
+    dge::DynamicGraphEngine::Config cfg;
+    cfg.nodes = 100;
+    cfg.buckets = 8;
+    cfg.pool_threads = 2;
+    cfg.cache_enabled = false;
+    cfg.wal_path = wal_path;
+    cfg.wal_sync_mode = true;
+    cfg.snapshot_path = snap_path;
+    return std::make_unique<dge::DynamicGraphEngine>(cfg);
+  };
+  auto a = mk();
+  a->AddEdge(1, 11);
+  a->AddEdge(2, 12);
+  CHECK(a->Checkpoint());
+  a->AddEdge(3, 13);
+  a->AddEdge(4, 14);
+  a->Shutdown();
+  // 备份完整 WAL,再让引擎正常 Checkpoint(新快照覆盖 + WAL 截断),
+  // 然后把完整 WAL 写回——模拟「快照已 rename、WAL 未轮转」的崩溃
+  // 状态。恢复必须靠 seq > snapshot_lsn 过滤旧记录,结果等于最终态。
+  {
+    std::ifstream f(wal_path, std::ios::binary);
+    std::string backup((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+    auto b = mk();
+    CHECK(b->Recover());
+    CHECK(b->Checkpoint());
+    b->Shutdown();
+    std::ofstream o(wal_path, std::ios::binary | std::ios::trunc);
+    o << backup;
+  }
+  auto rec = mk();
+  CHECK(rec->Recover());
+  CHECK(SyncQuery(*rec, dge::QueryType::kDistance, 1, 11).distance == 1);
+  CHECK(SyncQuery(*rec, dge::QueryType::kDistance, 2, 12).distance == 1);
+  CHECK(SyncQuery(*rec, dge::QueryType::kDistance, 3, 13).distance == 1);
+  CHECK(SyncQuery(*rec, dge::QueryType::kDistance, 4, 14).distance == 1);
+  rec->Shutdown();
+}
+
 void TestTimerEarlyTask() {
   printf("[test] timer: earlier task inserted during wait fires on time\n");
   dge::TimerHeap timer;
@@ -1077,6 +1143,8 @@ int main() {
   TestWalSeqContinuity();
   TestWalOpCodeTamper();
   TestWalBadTailTruncate();
+  TestWalAppendFailureIsolation();
+  TestWalCrashBetweenRenameAndRotate();
   TestWalCheckpointConcurrent();
   TestTimerEarlyTask();
   TestHistogramBuckets();

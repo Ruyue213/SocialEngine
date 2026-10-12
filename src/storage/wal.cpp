@@ -12,11 +12,13 @@ namespace dge {
 
 namespace {
 
-void FsyncFd(int fd) {
+int FsyncFd(int fd) {
 #if defined(__linux__)
-  ::fdatasync(fd);
+  return ::fdatasync(fd);
 #elif defined(__APPLE__)
-  ::fsync(fd);
+  return ::fsync(fd);
+#else
+  return ::fsync(fd);
 #endif
 }
 
@@ -107,7 +109,10 @@ bool WalWriter::Append(uint8_t op, uint64_t u, uint64_t v) {
       errors_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
-    FsyncFd(fd_);
+    if (FsyncFd(fd_) != 0) {
+      errors_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     bytes_.fetch_add(rec.size(), std::memory_order_relaxed);
     return true;
   }
@@ -136,7 +141,9 @@ void WalWriter::FlushLocked() {
       errors_.fetch_add(1, std::memory_order_relaxed);
     } else {
       bytes_.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
-      FsyncFd(fd_);
+      if (FsyncFd(fd_) != 0) {
+        errors_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   } else {
     errors_.fetch_add(1, std::memory_order_relaxed);
@@ -299,34 +306,80 @@ bool RecoverFromWal(const std::string& wal_path, const std::string& snapshot_pat
 bool WriteSnapshotFile(const std::string& snapshot_path, uint64_t snapshot_lsn,
                        const std::function<bool(std::function<void(uint64_t, uint64_t)>)>&
                            foreach_edge) {
+  // 崩溃原子性协议(2026-10 第二轮审查加固):
+  //   1. 写临时文件(完整写入)
+  //   2. fsync 临时文件——数据先于元数据落盘
+  //   3. rename 原子发布(POSIX 保证 rename 的原子性)
+  //   4. fsync 父目录——让 rename 本身持久化;断电后 rename 要么
+  //      完全生效要么完全未生效,不会出现「快照路径指向未落盘数据」
+  // 原实现用 ofstream 直接写 + close 后立即 rename:close 不保证
+  // fsync,断电时 rename 可能先于数据持久化,恢复读到空/损坏快照。
   std::string tmp = snapshot_path + ".tmp";
-  std::ofstream of(tmp, std::ios::binary | std::ios::trunc);
-  if (!of.good()) {
-    DGE_LOG_ERROR("snapshot open failed: %s", tmp.c_str());
-    return false;
-  }
   std::string body;
+  std::string head;
+  AppendU32(head, kSnapMagic);
+  AppendU64(head, snapshot_lsn);
   uint64_t count = 0;
   bool ok = foreach_edge([&](uint64_t u, uint64_t v) {
     AppendU64(body, u);
     AppendU64(body, v);
     ++count;
   });
+  AppendU64(head, count);
   if (!ok) {
+    DGE_LOG_ERROR("snapshot iterate failed");
     return false;
   }
-  std::string head;
-  AppendU32(head, kSnapMagic);
-  AppendU64(head, snapshot_lsn);
-  AppendU64(head, count);
-  of.write(head.data(), static_cast<std::streamsize>(head.size()));
-  of.write(body.data(), static_cast<std::streamsize>(body.size()));
-  of.close();
+  int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) {
+    DGE_LOG_ERROR("snapshot open failed: %s", std::strerror(errno));
+    return false;
+  }
+  auto write_all = [&](const std::string& data) {
+    size_t off = 0;
+    while (off < data.size()) {
+      ssize_t n = ::write(fd, data.data() + off, data.size() - off);
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        DGE_LOG_ERROR("snapshot write failed: %s", std::strerror(errno));
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        return false;
+      }
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  };
+  if (!write_all(head) || !write_all(body)) {
+    return false;
+  }
+  if (FsyncFd(fd) != 0) {
+    DGE_LOG_ERROR("snapshot fsync failed: %s", std::strerror(errno));
+    ::close(fd);
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  if (::close(fd) != 0) {
+    DGE_LOG_ERROR("snapshot close failed: %s", std::strerror(errno));
+    ::unlink(tmp.c_str());
+    return false;
+  }
   if (::rename(tmp.c_str(), snapshot_path.c_str()) != 0) {
     DGE_LOG_ERROR("snapshot rename failed: %s", std::strerror(errno));
+    ::unlink(tmp.c_str());
     return false;
   }
-  DGE_LOG_INFO("snapshot written: %llu edges at lsn=%llu",
+  // 目录 fsync:持久化 rename 目录项。
+  size_t slash = snapshot_path.find_last_of('/');
+  std::string dir = slash == std::string::npos ? "." : snapshot_path.substr(0, slash);
+  int dfd = ::open(dir.c_str(), O_RDONLY);
+  if (dfd >= 0) {
+    ::fsync(dfd);
+    ::close(dfd);
+  }
+  DGE_LOG_INFO("snapshot written: %llu edges at lsn=%llu (fsynced)",
                static_cast<unsigned long long>(count),
                static_cast<unsigned long long>(snapshot_lsn));
   return true;
