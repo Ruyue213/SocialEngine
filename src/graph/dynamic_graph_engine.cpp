@@ -901,7 +901,9 @@ EngineStats DynamicGraphEngine::stats() const {
          ctx.next_b.capacity() + ctx.scratch.capacity() + ctx.scratch2.capacity()) *
         sizeof(uint32_t);
   }
-  s.memory_bytes = pool_.bytes_in_use() + nodes_ * sizeof(storage::NodeAdjacency) +
+  // 修复:slab_bytes 此前定义了但从未赋值,/metrics 的 slab 指标恒为 0。
+  s.slab_bytes = pool_.bytes_in_use();
+  s.memory_bytes = s.slab_bytes + nodes_ * sizeof(storage::NodeAdjacency) +
                    visited_bytes + scratch_bytes;
   return s;
 }

@@ -3,3 +3,6 @@
 2026-10-12T22:52 zipf-hot-300k-16c-25s qps=2850 mem_mb=196.9 (optimized, baseline 3902 => 0.73x, 压缩解码取舍边界)
 2026-10-12T22:58 http-300k-16c-15s qps=20370 avg_us=371 p99_us=2048 (全链路 Multi-Reactor+线程池)
 2026-10-12T23:40 uniform-300k-16c-25s qps=56635 mem_mb=196.5 (Dekker双检协议+WAL-ahead后复测,与50860同波动区间,协议强化无回归)
+2026-10-13T18:00 load-sensitivity-300k-16c-15s pure-dist qps=64015 avg=28548us(排队主导) | pure-cf qps=16573 avg=382us | mixed(55/25/10/5/5) qps=50860
+2026-10-13T18:10 memory-split-300k deg20: adjacency 145.0MB / node-table 4.6MB / workspace(9T) 30.9MB / total 180.5MB vs baseline 71.8MB —— 压缩未兑现: 尾上限512致~50%条目未压缩+档位取整碎片; 每条目 12.7B vs 基线 6.3B
+2026-10-13T18:20 memory-split-300k deg200: adjacency 986MB vs baseline 658MB, 每条目 8.2B vs 5.5B —— 高度数下差距收窄(压缩覆盖率提升)但仍未反超
